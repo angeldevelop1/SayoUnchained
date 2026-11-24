@@ -663,9 +663,9 @@ final class AppState: ObservableObject {
         }
         var renewed = 0
         for old in due {
-            guard let lib = library.first(where: { $0.id == old.libraryID }),
-                  let cert = certificates.first(where: { $0.fromAppleID && $0.nickname == old.certificateName })
-                      ?? certificates.first(where: { $0.fromAppleID }) else { continue }
+            let cert = certificates.first(where: { $0.fromAppleID && $0.nickname == old.certificateName })
+                ?? certificates.first(where: { $0.fromAppleID })
+            guard let lib = library.first(where: { $0.id == old.libraryID }), let cert = cert else { continue }
             var opts = SayoCore.SignOptions()
             opts.removePlugins = settings.autoRemovePlugins
             opts.removeWatch = settings.removeWatchApps
