@@ -33,6 +33,10 @@ private struct Failable<T: Decodable>: Decodable {
 }
 
 struct PersistedState: Codable {
+    enum CodingKeys: String, CodingKey {
+        case library, signed, certificates, sources, settings
+    }
+
     var library: [LibraryApp] = []
     var signed: [SignedApp] = []
     var certificates: [StoredCertificate] = []
