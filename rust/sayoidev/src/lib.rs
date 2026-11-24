@@ -7,6 +7,9 @@
 //! * `sayo_idev_install`: opens the RPPairing tunnel to this iPhone through LocalDevVPN, uploads
 //!   the IPA over AFC and installs it with installation_proxy, as SideStore does. This works for
 //!   free Apple ID profiles, which over-the-air installs refuse.
+//! * `sayo_idev_installed_apps`: asks installation_proxy through the same tunnel for the bundle
+//!   IDs of the installed user apps, so the app can drop the records of apps deleted from the
+//!   Home Screen.
 //!
 //! The tunnel code mirrors idevice's own FFI (`ffi/src/tunnel_provider.rs`).
 
@@ -16,11 +19,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use idevice::IdeviceError;
+use idevice::RsdService;
 use idevice::remote_pairing::{
     PairableHost, PairableHostInfo, RemotePairingClient, RpPairingFile, RpPairingSocket,
     connect_tls_psk_tunnel_native,
 };
 use idevice::rsd::RsdHandshake;
+use idevice::services::installation_proxy::InstallationProxyClient;
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
@@ -291,6 +296,56 @@ pub unsafe extern "C" fn sayo_idev_check(
         RT.block_on(async move {
             let (_adapter, hs) = open_tunnel(&path, sa).await?;
             Ok(format!("connected, {} services", hs.services.len()))
+        })
+    })();
+    match res {
+        Ok(s) => {
+            write_out(out, out_len, &s);
+            0
+        }
+        Err(e) => {
+            write_out(err, err_len, &e);
+            -1
+        }
+    }
+}
+
+/// Lists the bundle IDs of this iPhone's installed user apps through the tunnel,
+/// written to `out` as a JSON array of strings. 0 on success.
+///
+/// # Safety
+/// Strings must be valid NUL-terminated UTF-8; `out`/`err` must point to that many bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sayo_idev_installed_apps(
+    pairing_path: *const c_char,
+    addr: *const c_char,
+    port: u16,
+    out: *mut c_char,
+    out_len: usize,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    let res: Result<String, String> = (|| {
+        let path = cstr(pairing_path)?;
+        let sa = sockaddr(&cstr(addr)?, port)?;
+        RT.block_on(async move {
+            let query = async {
+                let (mut adapter, mut hs) = open_tunnel(&path, sa).await?;
+                let mut client = InstallationProxyClient::connect_rsd(&mut adapter, &mut hs)
+                    .await
+                    .map_err(describe)?;
+                let apps = client
+                    .get_apps(Some("User"), None)
+                    .await
+                    .map_err(describe)?;
+                let mut ids: Vec<&String> = apps.keys().collect();
+                ids.sort();
+                Ok::<String, String>(serde_json::json!(ids).to_string())
+            };
+            // A lookup is quick; the bound only keeps a stalled tunnel from hanging the app.
+            tokio::time::timeout(Duration::from_secs(60), query)
+                .await
+                .map_err(|_| "installed apps: timed out".to_string())?
         })
     })();
     match res {

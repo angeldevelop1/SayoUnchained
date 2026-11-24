@@ -30,6 +30,21 @@ struct AppleIDAppsView: View {
             .navigationTitle(L("Apple ID"))
         }
         .navigationViewStyle(.stack)
+        .task { await pruneStaleRecords() }
+    }
+
+    /// This tab is a signing record, not a mirror of the Home Screen: an app deleted
+    /// there would stay listed forever. When this iPhone is paired, ask it over the
+    /// tunnel which apps are really installed and drop the records that are gone.
+    /// Any doubt (not paired, tunnel down, empty answer) leaves every record alone.
+    func pruneStaleRecords() async {
+        guard DeviceLink.isPaired else { return }
+        guard let ids = try? await DeviceLink.installedBundleIDs(address: state.settings.tunnelAddress, port: 49152),
+              !ids.isEmpty else { return }
+        let installed = Set(ids)
+        for app in state.signed.filter({ $0.viaAppleID == true && !installed.contains($0.bundleID) }) {
+            state.deleteSigned(app)
+        }
     }
 }
 

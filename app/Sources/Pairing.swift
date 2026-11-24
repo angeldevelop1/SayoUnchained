@@ -95,6 +95,47 @@ enum DeviceLink {
             }
         }
     }
+
+    /// Resumes a continuation at most once, carrying a value (see ResumeOnce).
+    private final class ResumeOnceValue<T> {
+        private let lock = NSLock()
+        private var cont: CheckedContinuation<T, Error>?
+        init(_ cont: CheckedContinuation<T, Error>) { self.cont = cont }
+        func resume(_ result: Result<T, Error>) {
+            lock.lock()
+            let c = cont
+            cont = nil
+            lock.unlock()
+            c?.resume(with: result)
+        }
+    }
+
+    /// Bundle IDs of the user apps this iPhone actually has installed, asked over the
+    /// pairing tunnel (installation_proxy). Throws when the tunnel cannot answer; the
+    /// watchdog frees the caller the same way as in `install`.
+    static func installedBundleIDs(address: String, port: Int) async throws -> [String] {
+        guard isPaired else { throw SayoError(L("Pair this iPhone first: Settings → Installing → Pair this iPhone")) }
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[String], Error>) in
+            let once = ResumeOnceValue(cont)
+            Task.detached(priority: .userInitiated) {
+                var out = [CChar](repeating: 0, count: 65536)
+                var err = [CChar](repeating: 0, count: 512)
+                let rc = sayo_idev_installed_apps(DeviceLink.pairingFile.path, address, UInt16(clamping: port), &out, out.count, &err, err.count)
+                if rc != 0 {
+                    once.resume(.failure(SayoError(String(cString: err))))
+                } else if let data = String(cString: out).data(using: .utf8),
+                          let ids = try? JSONSerialization.jsonObject(with: data) as? [String] {
+                    once.resume(.success(ids))
+                } else {
+                    once.resume(.failure(SayoError(L("The iPhone's answer could not be read"))))
+                }
+            }
+            Task.detached {
+                try? await Task.sleep(nanoseconds: 300_000_000_000)
+                once.resume(.failure(SayoError(L("The iPhone did not answer in time. Check that LocalDevVPN is connected and try again."))))
+            }
+        }
+    }
 }
 
 /// Runs the pairable host: advertises SayoSign over Bonjour and waits for the user to tap

@@ -22,6 +22,10 @@ int32_t sayo_idev_pair_host(const char *name, const char *model, const char *out
 /// Opens the pairing tunnel (LocalDevVPN) and reports how many services the device lists.
 int32_t sayo_idev_check(const char *pairing_path, const char *addr, uint16_t port,
                         char *out, size_t out_len, char *err, size_t err_len);
+/// Lists the bundle IDs of the installed user apps through the tunnel, written to `out`
+/// as a JSON array of strings. Returns 0 on success.
+int32_t sayo_idev_installed_apps(const char *pairing_path, const char *addr, uint16_t port,
+                                 char *out, size_t out_len, char *err, size_t err_len);
 /// Uploads and installs an IPA through the pairing tunnel (works with free Apple ID profiles).
 int32_t sayo_idev_install(const char *pairing_path, const char *addr, uint16_t port,
                           const char *ipa_path, sayo_idev_progress_cb progress, void *ctx,
