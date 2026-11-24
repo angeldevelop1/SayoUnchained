@@ -103,6 +103,8 @@ struct AppSettings: Codable, Equatable {
     var keepAliveAudio = true
     var udid = ""
     var appleIDTeam = ""
+    /// Renew Apple ID signatures on their own shortly before they lapse.
+    var autoReSign = true
     /// 0 = follow the system, 1 = light, 2 = black.
     var appearance = 0
     /// Manifest service (a Cloudflare Worker) for installing without the local CA profile.
@@ -132,6 +134,7 @@ struct AppSettings: Codable, Equatable {
         keepAliveAudio = (try? c.decodeIfPresent(Bool.self, forKey: .keepAliveAudio)) ?? d.keepAliveAudio
         udid = (try? c.decodeIfPresent(String.self, forKey: .udid)) ?? d.udid
         appleIDTeam = (try? c.decodeIfPresent(String.self, forKey: .appleIDTeam)) ?? d.appleIDTeam
+        autoReSign = (try? c.decodeIfPresent(Bool.self, forKey: .autoReSign)) ?? d.autoReSign
         appearance = (try? c.decodeIfPresent(Int.self, forKey: .appearance)) ?? d.appearance
         manifestService = (try? c.decodeIfPresent(String.self, forKey: .manifestService)) ?? d.manifestService
         installMethod = (try? c.decodeIfPresent(Int.self, forKey: .installMethod)) ?? d.installMethod

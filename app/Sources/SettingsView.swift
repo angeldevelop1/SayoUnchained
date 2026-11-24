@@ -149,13 +149,15 @@ struct SettingsView: View {
                     }
                 }
 
-                Section(header: Text(L("Apple ID"))) {
+                Section(header: Text(L("Apple ID")),
+                        footer: Text(L("Free Apple ID profiles lapse after 7 days. With auto re-sign on, SayoUnchained renews the ones about to expire when it opens and this iPhone is paired, so they keep working."))) {
                     HStack {
                         Text("UDID")
                         TextField("00008110-…", text: $state.settings.udid)
                             .multilineTextAlignment(.trailing).foregroundColor(.secondary)
                             .autocapitalization(.allCharacters).disableAutocorrection(true)
                     }
+                    Toggle(L("Auto re-sign before expiry"), isOn: $state.settings.autoReSign)
                 }
 
                 Section(header: Text(L("Storage"))) {

@@ -30,7 +30,10 @@ struct AppleIDAppsView: View {
             .navigationTitle(L("Apple ID"))
         }
         .navigationViewStyle(.stack)
-        .task { await pruneStaleRecords() }
+        .task {
+            await pruneStaleRecords()
+            await state.autoReSignIfNeeded()
+        }
     }
 
     /// This tab is a signing record, not a mirror of the Home Screen: an app deleted
@@ -42,7 +45,9 @@ struct AppleIDAppsView: View {
         guard let ids = try? await DeviceLink.installedBundleIDs(address: state.settings.tunnelAddress, port: 49152),
               !ids.isEmpty else { return }
         let installed = Set(ids)
-        for app in state.signed.filter({ $0.viaAppleID == true && !installed.contains($0.bundleID) }) {
+        // Container apps never reach the Home Screen, so their absence from the
+        // installed list says nothing about them; they are exempt.
+        for app in state.signed.filter({ $0.viaAppleID == true && $0.container != true && !installed.contains($0.bundleID) }) {
             state.deleteSigned(app)
         }
     }

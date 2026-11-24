@@ -93,8 +93,12 @@ final class AppState: ObservableObject {
     private var loadFailed = false
     private var savePending = false
     private var scanningInbox = false
+    private var autoReSigning = false
 
-    init() { load() }
+    init() {
+        load()
+        Task { await self.autoReSignIfNeeded() }
+    }
 
     func load() {
         loading = true
@@ -639,6 +643,43 @@ final class AppState: ObservableObject {
             try? FileManager.default.removeItem(at: workRoot)
             throw error
         }
+    }
+
+    /// Free Apple ID profiles lapse after 7 days. When this iPhone is paired, quietly
+    /// renew the ones about to lapse — the same sign + install as a manual Re-sign —
+    /// so simply opening SayoUnchained now and then keeps them working. Failures are
+    /// silent on purpose: nothing here may interrupt a launch with an alert or a
+    /// sign-in prompt (a stale Apple ID session just throws inside performSign), and
+    /// a record that could not be renewed is left exactly as it was.
+    func autoReSignIfNeeded() async {
+        guard settings.autoReSign, DeviceLink.isPaired, !autoReSigning else { return }
+        autoReSigning = true
+        defer { autoReSigning = false }
+        let due = signed.filter { record in
+            record.viaAppleID == true && record.container != true
+                && record.effectiveExpiry.timeIntervalSinceNow < 24 * 3600
+                && record.libraryID != nil
+                && library.contains { $0.id == record.libraryID }
+        }
+        var renewed = 0
+        for old in due {
+            guard let lib = library.first(where: { $0.id == old.libraryID }),
+                  let cert = certificates.first(where: { $0.fromAppleID && $0.nickname == old.certificateName })
+                      ?? certificates.first(where: { $0.fromAppleID }) else { continue }
+            var opts = SayoCore.SignOptions()
+            opts.removePlugins = settings.autoRemovePlugins
+            opts.removeWatch = settings.removeWatchApps
+            guard let fresh = try? await performSign(app: lib, cert: cert, options: opts, tweaks: []) { _, _ in } else { continue }
+            // The renewed IPA only helps once it is on the phone; a failed install is
+            // not an error here — the fresh record waits in the Signed list.
+            _ = try? await Installer.install(fresh, state: self)
+            // The fresh record supersedes the old one (and performSign already
+            // scheduled its expiry reminder); keeping the old record would renew
+            // the same stale signature again on every launch.
+            deleteSigned(old)
+            renewed += 1
+        }
+        if renewed > 0 { show(LF("Auto re-signed %d app(s)", renewed)) }
     }
 
     func scanInbox() async {
