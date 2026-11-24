@@ -3,6 +3,7 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <mach/mach.h>
+#include <mach/vm_region.h>
 #include <objc/runtime.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -47,8 +48,9 @@ static bool make_writable(void *addr, size_t len) {
     return kr == KERN_SUCCESS;
 }
 
-static void rebind_image(const struct mach_header_64 *mh, intptr_t slide, const rebind_entry *entries, size_t count, void **orig_out) {
-    if (mh->magic != MH_MAGIC_64) return;
+static size_t rebind_image(const struct mach_header_64 *mh, intptr_t slide, const rebind_entry *entries, size_t count, void **orig_out) {
+    if (mh->magic != MH_MAGIC_64) return 0;
+    size_t replaced = 0;
     const struct segment_command_64 *linkedit = NULL;
     const struct symtab_command *symtab = NULL;
     const struct dysymtab_command *dysymtab = NULL;
@@ -93,14 +95,18 @@ static void rebind_image(const struct mach_header_64 *mh, intptr_t slide, const 
                 void *cur = ptrs[k];
                 for (size_t e = 0; e < count; e++) {
                     bool hit = cur == entries[e].target && cur;
-                    if (!hit && sname && entries[e].name[0] && sname[0] == '_' && !strcmp(sname + 1, entries[e].name)) hit = true;
+                    if (!hit && sname && entries[e].name[0] && !strcmp(sname, entries[e].name)) hit = true;
                     if (!hit || cur == entries[e].replacement) continue;
                     if (orig_out && !orig_out[e] && cur != entries[e].target) orig_out[e] = entries[e].target;
-                    if (make_writable(&ptrs[k], sizeof(void *))) ptrs[k] = entries[e].replacement;
+                    if (make_writable(&ptrs[k], sizeof(void *))) {
+                        ptrs[k] = entries[e].replacement;
+                        replaced++;
+                    }
                 }
             }
         }
     }
+    return replaced;
 }
 
 static void on_add_image(const struct mach_header *mh, intptr_t slide) {
@@ -123,14 +129,16 @@ static bool rebind_hook(void *target, void *replacement) {
     e->target = target;
     e->replacement = replacement;
     memcpy(e->name, name, sizeof e->name);
+    size_t replaced = 0;
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++)
-        rebind_image((const struct mach_header_64 *)_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), e, 1, NULL);
+        replaced += rebind_image((const struct mach_header_64 *)_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), e, 1, NULL);
     bool reg = !g_dyld_registered;
     g_dyld_registered = true;
+    if (!replaced) g_rebind_count--;
     pthread_mutex_unlock(&g_lock);
     if (reg) _dyld_register_func_for_add_image(on_add_image);
-    return true;
+    return replaced != 0;
 }
 
 #if defined(__arm64__) || defined(__aarch64__)
@@ -161,19 +169,19 @@ static uint32_t *relocate(uint32_t *out, uint32_t ins, uint64_t pc) {
     if ((ins & 0xff000010) == 0x54000000) {
         uint64_t t = pc + (uint64_t)(sext((ins >> 5) & 0x7ffff, 19) << 2);
         *out++ = (ins & 0xff00001f) | (2 << 5);
-        *out++ = 0x14000005;
+        *out++ = 0x14000006;
         return emit_abs_jump(out, t, false);
     }
     if ((ins & 0x7e000000) == 0x34000000) {
         uint64_t t = pc + (uint64_t)(sext((ins >> 5) & 0x7ffff, 19) << 2);
         *out++ = (ins & 0xff00001f) | (2 << 5);
-        *out++ = 0x14000005;
+        *out++ = 0x14000006;
         return emit_abs_jump(out, t, false);
     }
     if ((ins & 0x7e000000) == 0x36000000) {
         uint64_t t = pc + (uint64_t)(sext((ins >> 5) & 0x3fff, 14) << 2);
         *out++ = (ins & 0xfff8001f) | (2 << 5);
-        *out++ = 0x14000005;
+        *out++ = 0x14000006;
         return emit_abs_jump(out, t, false);
     }
     if ((ins & 0x9f000000) == 0x10000000) {
@@ -208,15 +216,23 @@ static uint32_t *relocate(uint32_t *out, uint32_t ins, uint64_t pc) {
     return out;
 }
 
-static bool inline_hook(void *target, void *replacement, void **orig) {
+/* 1 = hooked, 0 = failed, -1 = function too short to patch, -2 = already hooked */
+static int inline_hook(void *target, void *replacement, void **orig) {
     uint32_t *code = (uint32_t *)target;
+    if (code[0] == 0x58000051 && code[1] == 0xd61f0220) return -2;
+    for (int i = 0; i < 3; i++) {
+        uint32_t ins = code[i];
+        if (ins == 0xd65f03c0) return -1;
+        if ((ins & 0xfc000000) == 0x14000000) return -1;
+        if ((ins & 0xfffffc1f) == 0xd61f0000) return -1;
+    }
     size_t tramp_size = 4 * 64;
     void *tramp = mmap(NULL, tramp_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (tramp == MAP_FAILED) return false;
+    if (tramp == MAP_FAILED) return 0;
     uint32_t *t = tramp;
     for (int i = 0; i < 4; i++) t = relocate(t, code[i], (uint64_t)(uintptr_t)(code + i));
     t = emit_abs_jump(t, (uint64_t)(uintptr_t)(code + 4), false);
-    if (mprotect(tramp, tramp_size, PROT_READ | PROT_EXEC)) { munmap(tramp, tramp_size); return false; }
+    if (mprotect(tramp, tramp_size, PROT_READ | PROT_EXEC)) { munmap(tramp, tramp_size); return 0; }
     sys_icache_invalidate(tramp, tramp_size);
     uint32_t patch[4];
     patch[0] = 0x58000051;
@@ -227,23 +243,29 @@ static bool inline_hook(void *target, void *replacement, void **orig) {
     vm_size_t len = (vm_address_t)target + sizeof patch - page;
     if (vm_protect(mach_task_self(), page, len, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
         munmap(tramp, tramp_size);
-        return false;
+        return 0;
     }
     memcpy(target, patch, sizeof patch);
     vm_protect(mach_task_self(), page, len, false, VM_PROT_READ | VM_PROT_EXECUTE);
     sys_icache_invalidate(target, sizeof patch);
     if (orig) *orig = tramp;
-    return true;
+    return 1;
 }
 #else
-static bool inline_hook(void *target, void *replacement, void **orig) { return false; }
+static int inline_hook(void *target, void *replacement, void **orig) { return 0; }
 #endif
 
-static bool hook_function(void *symbol, void *replace, void **result) {
-    if (!symbol || !replace) return false;
+/* Returns an LHError code (see LHStrError): 0 when the hook is in place. */
+static int hook_function(void *symbol, void *replace, void **result) {
+    if (!symbol || !replace) return 3;
     if (result) *result = symbol;
-    if (can_patch_text() && inline_hook(symbol, replace, result)) return true;
-    return rebind_hook(symbol, replace);
+    if (can_patch_text()) {
+        int st = inline_hook(symbol, replace, result);
+        if (st == 1) return 0;
+        if (st == -1) return 2;
+        if (st == -2) return 3;
+    }
+    return rebind_hook(symbol, replace) ? 0 : 4;
 }
 
 EXPORT void MSHookFunction(void *symbol, void *replace, void **result) {
@@ -302,7 +324,10 @@ EXPORT MSImageRef MSGetImageByName(const char *file) {
     n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, base)) return _dyld_get_image_header(i);
+        if (!name) continue;
+        const char *b = strrchr(name, '/');
+        b = b ? b + 1 : name;
+        if (!strcmp(b, base)) return _dyld_get_image_header(i);
     }
     return NULL;
 }
@@ -338,6 +363,7 @@ EXPORT void *MSFindSymbol(MSImageRef image, const char *name) {
         void *p = find_in_image((const struct mach_header_64 *)mh, _dyld_get_image_vmaddr_slide(i), name);
         if (p) return p;
     }
+    if (image) return NULL;
     if (name[0] == '_') return dlsym(RTLD_DEFAULT, name + 1);
     return dlsym(RTLD_DEFAULT, name);
 }
@@ -345,9 +371,18 @@ EXPORT void *MSFindSymbol(MSImageRef image, const char *name) {
 EXPORT void MSHookMemory(void *target, const void *data, size_t size) {
     vm_address_t page = (vm_address_t)target & ~(vm_address_t)(PAGE_SIZE - 1);
     vm_size_t len = (vm_address_t)target + size - page;
+    vm_prot_t orig = VM_PROT_READ | VM_PROT_EXECUTE;
+    vm_address_t raddr = page;
+    vm_size_t rsize = 0;
+    vm_region_basic_info_data_64_t rinfo;
+    mach_msg_type_number_t rcount = VM_REGION_BASIC_INFO_COUNT_64;
+    memory_object_name_t robj;
+    if (vm_region_64(mach_task_self(), &raddr, &rsize, VM_REGION_BASIC_INFO_64,
+                     (vm_region_info_t)&rinfo, &rcount, &robj) == KERN_SUCCESS)
+        orig = rinfo.protection;
     if (vm_protect(mach_task_self(), page, len, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) return;
     memcpy(target, data, size);
-    vm_protect(mach_task_self(), page, len, false, VM_PROT_READ | VM_PROT_EXECUTE);
+    vm_protect(mach_task_self(), page, len, false, orig);
     sys_icache_invalidate(target, size);
 }
 
@@ -381,15 +416,15 @@ struct libhooker_image {
 };
 
 EXPORT int LHHookFunctions(const struct LHFunctionHook *hooks, int count) {
-    int ok = 0;
     for (int i = 0; i < count; i++) {
-        if (hook_function(hooks[i].function, hooks[i].replacement, (void **)hooks[i].oldptr)) ok++;
+        int err = hook_function(hooks[i].function, hooks[i].replacement, (void **)hooks[i].oldptr);
+        if (err) return err;
     }
-    return ok;
+    return 0;
 }
 
 EXPORT int LBHookMessage(Class cls, SEL sel, void *replacement, void *old_ptr) {
-    if (!class_getInstanceMethod(cls, sel)) return 2;
+    if (!class_getInstanceMethod(cls, sel)) return 1;
     MSHookMessageEx(cls, sel, (IMP)replacement, (IMP *)old_ptr);
     return 0;
 }
@@ -434,7 +469,9 @@ EXPORT bool LHFindSymbols(struct libhooker_image *img, const char **names, void 
     return all;
 }
 
-EXPORT int LHPatchMemory(const void *patches, int count) { return 0; }
+/* The patch struct layout is not defined anywhere in this codebase, so applying
+ * patches blindly could write through wrong offsets; fail honestly instead. */
+EXPORT int LHPatchMemory(const void *patches, int count) { return 4; }
 
 EXPORT void *LHExecMemory(void *page, void *data, size_t size) { return NULL; }
 
@@ -446,13 +483,23 @@ struct substitute_function_hook {
 };
 
 EXPORT int substitute_hook_functions(const struct substitute_function_hook *hooks, size_t nhooks, void *recordp, int options) {
-    for (size_t i = 0; i < nhooks; i++) hook_function(hooks[i].function, hooks[i].replacement, (void **)hooks[i].old_ptr);
+    for (size_t i = 0; i < nhooks; i++) {
+        int err = hook_function(hooks[i].function, hooks[i].replacement, (void **)hooks[i].old_ptr);
+        if (err) return err;
+    }
     return 0;
 }
 
 EXPORT int substitute_hook_objc_message(Class cls, SEL sel, void *replacement, void *old_ptr, bool *created) {
-    MSHookMessageEx(cls, sel, (IMP)replacement, (IMP *)old_ptr);
     if (created) *created = false;
+    if (!cls || !sel || !replacement) return 0;
+    bool direct = false;
+    unsigned int n = 0;
+    Method *own = class_copyMethodList(cls, &n);
+    for (unsigned int i = 0; i < n; i++) if (method_getName(own[i]) == sel) { direct = true; break; }
+    free(own);
+    MSHookMessageEx(cls, sel, (IMP)replacement, (IMP *)old_ptr);
+    if (created) *created = !direct && class_getInstanceMethod(cls, sel) != NULL;
     return 0;
 }
 

@@ -28,6 +28,7 @@ struct SignView: View {
     @State private var done: SignedApp?
     @State private var error: String?
     @State private var setup = false
+    @State private var appeared = false
 
     enum PickKind: Identifiable {
         case icon, tweak, entitlements
@@ -94,7 +95,7 @@ struct SignView: View {
                          ? LF("This profile is made for %@. The app keeps its own bundle ID, so several apps can be installed side by side; app extensions are removed.", fb)
                          : LF("This profile only allows %@, the bundle ID will be replaced and app extensions removed.", fb)
                            + (fb.caseInsensitiveCompare(Bundle.main.bundleIdentifier ?? "") == .orderedSame
-                              ? "\n\n⚠️ " + L("SayoSign itself has this bundle ID. An app signed with this certificate cannot be installed while SayoSign uses the same ID.")
+                              ? "\n\n⚠️ " + L("SayoUnchained itself has this bundle ID. An app signed with this certificate cannot be installed while SayoUnchained uses the same ID.")
                               : ""))
                 }) {
                     if explicitBundle != nil {
@@ -133,8 +134,8 @@ struct SignView: View {
                     Toggle(L("Enable file sharing"), isOn: $fileSharing)
                     Toggle(isOn: $inside) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(L("Run inside SayoSign (experimental)"))
-                            Text(L("Like LiveContainer: not installed in iOS, no app limit. Use the same certificate SayoSign itself is signed with."))
+                            Text(L("Run inside SayoUnchained (experimental)"))
+                            Text(L("Like LiveContainer: not installed in iOS, no app limit. Use the same certificate SayoUnchained itself is signed with."))
                                 .font(.caption2).foregroundColor(.secondary)
                         }
                     }
@@ -160,10 +161,17 @@ struct SignView: View {
                     Section { Text(e).foregroundColor(.red).font(.callout) }
                 }
                 if let s = done, s.container == true {
-                    Section(footer: Text(L("SayoSign closes; open it again and the app starts inside it. Close that app and open SayoSign again to come back."))) {
+                    Section(footer: Text(L("SayoUnchained closes; open it again and the app starts inside it. Close that app and open SayoUnchained again to come back."))) {
                         Button {
-                            do { try Container.run(s, ipa: state.ipaURL(s)) } catch { self.error = error.localizedDescription }
-                        } label: { Label(L("Run inside SayoSign"), systemImage: "play.fill") }
+                            Task {
+                                state.busy = L("Preparing")
+                                defer { state.busy = nil }
+                                do {
+                                    let appDir = try await Container.prepare(s, ipa: state.ipaURL(s))
+                                    try Container.run(s, appDir: appDir)
+                                } catch { self.error = error.localizedDescription }
+                            }
+                        } label: { Label(L("Run inside SayoUnchained"), systemImage: "play.fill") }
                             .buttonStyle(PrimaryButtonStyle())
                             .listRowBackground(Color.clear)
                     }
@@ -205,8 +213,14 @@ struct SignView: View {
             }
             .sheet(isPresented: $setup) { InstallSetupView().environmentObject(state) }
             .onAppear {
-                removePlugins = state.settings.autoRemovePlugins
-                removeWatch = state.settings.removeWatchApps
+                // Only the first appearance seeds the toggles from Settings: onAppear
+                // can fire again after a sheet closes, and the user's changes on this
+                // very screen must not be silently reverted.
+                if !appeared {
+                    appeared = true
+                    removePlugins = state.settings.autoRemovePlugins
+                    removeWatch = state.settings.removeWatchApps
+                }
             }
         }
         .interactiveDismissDisabled(signing)

@@ -106,6 +106,9 @@ static int safe_rel(const char *n) {
 }
 
 int tar_extract(const uint8_t *p, size_t n, const char *dest) {
+    mkdirs(dest);
+    char dest_real[4096];
+    if (dest_realpath(dest, dest_real, sizeof dest_real)) return -1;
     size_t off = 0;
     char longname[4096] = "", longlink[4096] = "";
     while (off + 512 <= n) {
@@ -154,6 +157,7 @@ int tar_extract(const uint8_t *p, size_t n, const char *dest) {
         path_join(full, sizeof full, dest, nm);
         size_t fl = strlen(full);
         if (fl && full[fl - 1] == '/') full[fl - 1] = 0;
+        if (path_escapes_dest(dest_real, full)) { sayo_set_error("tar entry escapes destination: %s", nm); return -1; }
         char parent[4096];
         snprintf(parent, sizeof parent, "%s", full);
         char *slash = strrchr(parent, '/');

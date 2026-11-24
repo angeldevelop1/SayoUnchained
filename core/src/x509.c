@@ -39,6 +39,7 @@ static bool oid_eq(const der_item *it, const uint8_t *oid, size_t n) {
 static int64_t parse_time(const der_item *it) {
     char s[32];
     size_t n = it->len < 31 ? it->len : 31;
+    memset(s, 0, sizeof s);
     memcpy(s, it->val, n);
     s[n] = 0;
     struct tm tm;
@@ -59,7 +60,17 @@ static int64_t parse_time(const der_item *it) {
     tm.tm_hour = (q[4] - '0') * 10 + (q[5] - '0');
     tm.tm_min = (q[6] - '0') * 10 + (q[7] - '0');
     tm.tm_sec = (q[8] - '0') * 10 + (q[9] - '0');
-    return (int64_t)timegm(&tm);
+    /* Suffix: optional fractional seconds, then Z or a ±hhmm offset from UTC. */
+    const char *r = q + 10;
+    if (*r == '.' || *r == ',') { r++; while (*r >= '0' && *r <= '9') r++; }
+    long off = 0;
+    if ((*r == '+' || *r == '-') &&
+        r[1] >= '0' && r[1] <= '9' && r[2] >= '0' && r[2] <= '9' &&
+        r[3] >= '0' && r[3] <= '9' && r[4] >= '0' && r[4] <= '9') {
+        long oh = (r[1] - '0') * 10 + (r[2] - '0'), om = (r[3] - '0') * 10 + (r[4] - '0');
+        off = (oh * 3600 + om * 60) * (*r == '+' ? 1 : -1);
+    }
+    return (int64_t)timegm(&tm) - off;
 }
 
 static void name_attr(const der_item *name, const uint8_t *oid, size_t oidn, char *out, size_t cap) {

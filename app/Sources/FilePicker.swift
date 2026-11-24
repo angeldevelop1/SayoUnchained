@@ -12,7 +12,17 @@ final class FilePicker: NSObject, UIDocumentPickerDelegate {
     private var completion: (([URL]) -> Void)?
 
     func pick(_ types: [UTType], multiple: Bool = false, completion: @escaping ([URL]) -> Void) {
-        guard let top = Self.topController() else { return }
+        // One picker at a time: a second request must not replace the first one's
+        // completion, and a missing presenter must not fail silently either. Both
+        // cases deliver an empty result so the caller can react.
+        guard self.completion == nil else {
+            DispatchQueue.main.async { completion([]) }
+            return
+        }
+        guard let top = Self.topController() else {
+            DispatchQueue.main.async { completion([]) }
+            return
+        }
         let vc = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: true)
         vc.allowsMultipleSelection = multiple
         vc.shouldShowFileExtensions = true

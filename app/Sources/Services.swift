@@ -5,7 +5,8 @@ import UIKit
 enum Keychain {
     static let service = "dev.murk.sayosign"
 
-    static func set(_ value: String, for key: String) {
+    @discardableResult
+    static func set(_ value: String, for key: String) -> Bool {
         let data = Data(value.utf8)
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                 kSecAttrService as String: service,
@@ -14,7 +15,7 @@ enum Keychain {
         var add = q
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(add as CFDictionary, nil)
+        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
     }
 
     static func get(_ key: String) -> String? {
@@ -70,7 +71,14 @@ final class IconCache {
                 }
             }
         }
-        return best?.0
+        if let img = best?.0 { return img }
+        // Most modern apps keep their icon only in the asset catalog (Assets.car).
+        if let bundle = Bundle(path: appDir.path) {
+            for n in names {
+                if let img = UIImage(named: n, in: bundle, compatibleWith: nil) { return img }
+            }
+        }
+        return nil
     }
 }
 
@@ -132,7 +140,7 @@ enum RepoParser {
         let (data, resp) = try await URLSession.shared.data(for: req)
         if let h = resp as? HTTPURLResponse, !(200..<300).contains(h.statusCode) { throw SayoError("HTTP \(h.statusCode)") }
         guard let json = try? JSONSerialization.jsonObject(with: data) else { throw SayoError(L("This source is not valid JSON")) }
-        return parse(json, url: url, id: id)
+        return try parse(json, url: url, id: id)
     }
 
     static func str(_ d: [String: Any], _ keys: [String]) -> String {
@@ -151,20 +159,21 @@ enum RepoParser {
         return 0
     }
 
-    static func parse(_ json: Any, url: URL, id: UUID) -> RepoSource {
+    static func parse(_ json: Any, url: URL, id: UUID) throws -> RepoSource {
         var root: [String: Any] = [:]
         var appsRaw: [[String: Any]] = []
         if let d = json as? [String: Any] {
             root = d
+            // Only the real apps list counts: concatenating every array in the file
+            // invents and duplicates entries, and any JSON at all (even {}) would
+            // otherwise "parse" as an empty source.
             if let a = d["apps"] as? [[String: Any]] { appsRaw = a }
             else if let a = d["Apps"] as? [[String: Any]] { appsRaw = a }
-            else {
-                for (k, v) in d where k != "META" {
-                    if let a = v as? [[String: Any]] { appsRaw += a }
-                }
-            }
+            else { throw SayoError(L("This source has no apps list")) }
         } else if let a = json as? [[String: Any]] {
             appsRaw = a
+        } else {
+            throw SayoError(L("This source has no apps list"))
         }
         let meta = root["META"] as? [String: Any] ?? [:]
         let name = str(root, ["name", "Name"]).isEmpty ? (str(meta, ["repoName", "name"]).isEmpty ? (url.host ?? "Source") : str(meta, ["repoName", "name"])) : str(root, ["name", "Name"])

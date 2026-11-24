@@ -82,13 +82,25 @@ enum LocalCA {
             return
         }
         let caKey: SecKey
-        if let k = key(tag: caTag), FileManager.default.fileExists(atPath: caFile.path) {
+        if let k = key(tag: caTag) {
+            // The key survived: keep it, and rebuild the certificate file from it if that
+            // is what went missing. Recreating the key would orphan the trust profile the
+            // user already installed, and every OTA install would fail with no real error.
             caKey = k
+            if !FileManager.default.fileExists(atPath: caFile.path) {
+                guard let caPub = publicDER(caKey),
+                      let caCert = buildCert(serial: UInt64(Date().timeIntervalSince1970), issuer: "SayoUnchained Local CA (\(UIDevice.current.name))",
+                                             subject: "SayoUnchained Local CA (\(UIDevice.current.name))", days: 3650, pub: caPub, issuerPub: caPub,
+                                             ca: true, dns: nil, ip: nil, signer: caKey) else {
+                    throw SayoError(L("Cannot create local certificate authority"))
+                }
+                try caCert.write(to: caFile)
+            }
         } else {
             caKey = try makeKey(tag: caTag)
             guard let caPub = publicDER(caKey),
-                  let caCert = buildCert(serial: UInt64(Date().timeIntervalSince1970), issuer: "SayoSign Local CA (\(UIDevice.current.name))",
-                                         subject: "SayoSign Local CA (\(UIDevice.current.name))", days: 3650, pub: caPub, issuerPub: caPub,
+                  let caCert = buildCert(serial: UInt64(Date().timeIntervalSince1970), issuer: "SayoUnchained Local CA (\(UIDevice.current.name))",
+                                         subject: "SayoUnchained Local CA (\(UIDevice.current.name))", days: 3650, pub: caPub, issuerPub: caPub,
                                          ca: true, dns: nil, ip: nil, signer: caKey) else {
                 throw SayoError(L("Cannot create local certificate authority"))
             }
@@ -96,7 +108,7 @@ enum LocalCA {
         }
         let caCert = try Data(contentsOf: caFile)
         guard let caPub = publicDER(caKey) else { throw SayoError(L("Cannot read CA key")) }
-        let issuerName = SayoCore.certDetails(caCert)?.subject ?? "SayoSign Local CA"
+        let issuerName = SayoCore.certDetails(caCert)?.subject ?? "SayoUnchained Local CA"
         let leafKey = try makeKey(tag: leafTag)
         guard let leafPub = publicDER(leafKey),
               let leaf = buildCert(serial: UInt64(Date().timeIntervalSince1970) + 1, issuer: issuerName, subject: "localhost", days: 365,
@@ -133,17 +145,17 @@ enum LocalCA {
                                     "PayloadVersion": 1,
                                     "PayloadIdentifier": "dev.murk.sayosign.localca.cert",
                                     "PayloadUUID": UUID().uuidString,
-                                    "PayloadDisplayName": "SayoSign Local CA",
-                                    "PayloadDescription": "Lets SayoSign install apps from this iPhone. The private key never leaves the device.",
-                                    "PayloadCertificateFileName": "SayoSignLocalCA.cer",
+                                    "PayloadDisplayName": "SayoUnchained Local CA",
+                                    "PayloadDescription": "Lets SayoUnchained install apps from this iPhone. The private key never leaves the device.",
+                                    "PayloadCertificateFileName": "SayoUnchainedLocalCA.cer",
                                     "PayloadContent": ca]
         let outer: [String: Any] = ["PayloadType": "Configuration",
                                     "PayloadVersion": 1,
                                     "PayloadIdentifier": "dev.murk.sayosign.localca",
                                     "PayloadUUID": UUID().uuidString,
-                                    "PayloadDisplayName": "SayoSign Local Installer",
-                                    "PayloadOrganization": "SayoSign",
-                                    "PayloadDescription": "Trust for the on-device install server of SayoSign.",
+                                    "PayloadDisplayName": "SayoUnchained Local Installer",
+                                    "PayloadOrganization": "SayoUnchained",
+                                    "PayloadDescription": "Trust for the on-device install server of SayoUnchained.",
                                     "PayloadRemovalDisallowed": false,
                                     "PayloadContent": [inner]]
         return try? PropertyListSerialization.data(fromPropertyList: outer, format: .xml, options: 0)
@@ -173,6 +185,10 @@ final class InstallServer {
     private var plain: NWListener?
     private let queue = DispatchQueue(label: "dev.murk.sayosign.server")
     private var served: Served?
+    /// Recent installs, looked up by the token in each manifest's URLs: iOS may still be
+    /// downloading the previous app when the next one is served, and it must get the bytes
+    /// that belong to the manifest it read, not whatever was served last.
+    private var recent: [Served] = []
     /// What iOS asked for during the last install, for Settings → Install log.
     private var events: [String] = []
     private var bytesSent: Int64 = 0
@@ -188,6 +204,9 @@ final class InstallServer {
     private var port: UInt16 = 47616
     private var player: AVAudioPlayer?
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
+    /// keepAlive is shared by installs, pairing and UDID detection: it is reference
+    /// counted so one flow finishing cannot pull the protection from another.
+    private var keepAliveUsers = 0
     var onIPAFinished: (() -> Void)?
 
     var httpsBase: String { "https://localhost:\(port)" }
@@ -210,6 +229,14 @@ final class InstallServer {
         tp.allowLocalEndpointReuse = true
         let l1 = try NWListener(using: tp, on: NWEndpoint.Port(rawValue: p)!)
         l1.newConnectionHandler = { [weak self] c in self?.accept(c) }
+        // A listener that fails to start (port busy) only says so here; without this the
+        // failure is invisible and the install just dies at the relay.
+        l1.stateUpdateHandler = { [weak self] state in
+            if case .failed(let e) = state {
+                self?.note("Install server (HTTPS) failed: \(e.localizedDescription)")
+                self?.tls = nil
+            }
+        }
         l1.start(queue: queue)
         tls = l1
         let pp = NWParameters.tcp
@@ -217,6 +244,12 @@ final class InstallServer {
         pp.allowLocalEndpointReuse = true
         let l2 = try NWListener(using: pp, on: NWEndpoint.Port(rawValue: p + 1)!)
         l2.newConnectionHandler = { [weak self] c in self?.accept(c) }
+        l2.stateUpdateHandler = { [weak self] state in
+            if case .failed(let e) = state {
+                self?.note("Install server (HTTP) failed: \(e.localizedDescription)")
+                self?.plain = nil
+            }
+        }
         l2.start(queue: queue)
         plain = l2
     }
@@ -233,6 +266,12 @@ final class InstallServer {
         pp.allowLocalEndpointReuse = true
         let l2 = try NWListener(using: pp, on: NWEndpoint.Port(rawValue: p + 1)!)
         l2.newConnectionHandler = { [weak self] c in self?.accept(c) }
+        l2.stateUpdateHandler = { [weak self] state in
+            if case .failed(let e) = state {
+                self?.note("Install server (HTTP) failed: \(e.localizedDescription)")
+                self?.plain = nil
+            }
+        }
         l2.start(queue: queue)
         plain = l2
     }
@@ -244,7 +283,21 @@ final class InstallServer {
         plain = nil
     }
 
-    func serve(_ s: Served) { queue.sync { served = s } }
+    func serve(_ s: Served) {
+        queue.sync {
+            served = s
+            recent.removeAll { $0.token == s.token }
+            recent.append(s)
+            if recent.count > 3 { recent.removeFirst(recent.count - 3) }
+        }
+    }
+
+    /// The app a request belongs to, by the token in its URL; requests without one (the
+    /// UDID flow, the ping) get the most recently served app. Called on the server queue.
+    private func served(for token: String?) -> Served? {
+        if let token = token, !token.isEmpty, let s = recent.first(where: { $0.token == token }) { return s }
+        return served
+    }
 
     private func accept(_ c: NWConnection) {
         c.start(queue: queue)
@@ -274,7 +327,7 @@ final class InstallServer {
 
     private func respond(_ c: NWConnection, status: String, type: String, body: Data, close: Bool = true) {
         var h = "HTTP/1.1 \(status)\r\nContent-Type: \(type)\r\nContent-Length: \(body.count)\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
-        if type.contains("mobileconfig") { h = h.replacingOccurrences(of: "\r\n\r\n", with: "\r\nContent-Disposition: attachment; filename=\"SayoSign.mobileconfig\"\r\n\r\n") }
+        if type.contains("mobileconfig") { h = h.replacingOccurrences(of: "\r\n\r\n", with: "\r\nContent-Disposition: attachment; filename=\"SayoUnchained.mobileconfig\"\r\n\r\n") }
         var out = Data(h.utf8)
         out.append(body)
         c.send(content: out, completion: .contentProcessed { _ in if close { c.cancel() } })
@@ -286,7 +339,11 @@ final class InstallServer {
         guard parts.count >= 2 else { c.cancel(); return }
         let method = String(parts[0])
         var path = String(parts[1])
-        if let q = path.firstIndex(of: "?") { path = String(path[..<q]) }
+        var token: String?
+        if let q = path.firstIndex(of: "?") {
+            token = path[path.index(after: q)...].split(separator: "&").first { $0.hasPrefix("t=") }.map { String($0.dropFirst(2)) }
+            path = String(path[..<q])
+        }
         note("iOS → \(method) \(path)")
         switch path {
         case "/udid.mobileconfig":
@@ -312,7 +369,7 @@ final class InstallServer {
         case "/udid/done":
             let q = head.components(separatedBy: "\r\n").first ?? ""
             let u = q.range(of: "[0-9A-Fa-f-]{20,50}", options: .regularExpression).map { String(q[$0]) } ?? ""
-            let html = "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><body style='font:17px -apple-system;text-align:center;padding:40px 20px;background:#111;color:#eee'><h2>UDID</h2><p style='word-break:break-all;font-family:monospace'>\(u)</p><p><a style='display:inline-block;padding:14px 28px;border-radius:14px;background:#e8506a;color:#fff;text-decoration:none' href='sayosign://udid?value=\(u)'>Open SayoSign</a></p><script>location.href='sayosign://udid?value=\(u)'</script>"
+            let html = "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><body style='font:17px -apple-system;text-align:center;padding:40px 20px;background:#111;color:#eee'><h2>UDID</h2><p style='word-break:break-all;font-family:monospace'>\(u)</p><p><a style='display:inline-block;padding:14px 28px;border-radius:14px;background:#e8506a;color:#fff;text-decoration:none' href='sayosign://udid?value=\(u)'>Open SayoUnchained</a></p><script>location.href='sayosign://udid?value=\(u)'</script>"
             respond(c, status: "200 OK", type: "text/html; charset=utf-8", body: Data(html.utf8))
         case "/ping":
             respond(c, status: "200 OK", type: "text/plain", body: Data("ok".utf8))
@@ -323,14 +380,14 @@ final class InstallServer {
                 respond(c, status: "404 Not Found", type: "text/plain", body: Data())
             }
         case "/manifest.plist":
-            guard let s = served else { respond(c, status: "404 Not Found", type: "text/plain", body: Data()); return }
+            guard let s = served(for: token) else { respond(c, status: "404 Not Found", type: "text/plain", body: Data()); return }
             respond(c, status: "200 OK", type: "text/xml", body: manifest(s))
         case "/icon.png":
-            if let d = served?.icon { respond(c, status: "200 OK", type: "image/png", body: d) }
+            if let d = served(for: token)?.icon { respond(c, status: "200 OK", type: "image/png", body: d) }
             else if let d = UIImage(named: "Logo")?.pngData() { respond(c, status: "200 OK", type: "image/png", body: d) }
             else { respond(c, status: "404 Not Found", type: "text/plain", body: Data()) }
         case "/app.ipa":
-            guard let s = served else { respond(c, status: "404 Not Found", type: "text/plain", body: Data()); return }
+            guard let s = served(for: token) else { respond(c, status: "404 Not Found", type: "text/plain", body: Data()); return }
             streamFile(c, url: s.ipa, head: method == "HEAD")
         default:
             respond(c, status: "404 Not Found", type: "text/plain", body: Data())
@@ -356,8 +413,10 @@ final class InstallServer {
         bytesSent = 0
         note("IPA: sending \(size) bytes")
         let header = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: \(size)\r\nConnection: close\r\n\r\n"
-        c.send(content: Data(header.utf8), completion: .contentProcessed { _ in })
-        if head { try? h.close(); c.cancel(); return }
+        // Cancel inside the send completion (as respond() does): cancelling synchronously
+        // can win the race against the send and drop the headers before they leave.
+        c.send(content: Data(header.utf8), completion: .contentProcessed { _ in if head { c.cancel() } })
+        if head { try? h.close(); return }
         func pump() {
             let chunk = (try? h.read(upToCount: 1 << 18)) ?? Data()
             if chunk.isEmpty {
@@ -384,6 +443,7 @@ final class InstallServer {
     func keepAlive(_ on: Bool) {
         DispatchQueue.main.async {
             if on {
+                self.keepAliveUsers += 1
                 if self.bgTask == .invalid {
                     self.bgTask = UIApplication.shared.beginBackgroundTask(withName: "install") { [weak self] in
                         if let t = self?.bgTask { UIApplication.shared.endBackgroundTask(t) }
@@ -391,14 +451,24 @@ final class InstallServer {
                     }
                 }
                 guard AppState.shared.settings.keepAliveAudio, self.player == nil else { return }
-                try? AVAudioSession.sharedInstance().setCategory(.playback, options: [.mixWithOthers])
-                try? AVAudioSession.sharedInstance().setActive(true)
-                let p = try? AVAudioPlayer(data: InstallServer.silentWAV())
-                p?.numberOfLoops = -1
-                p?.volume = 0
-                p?.play()
-                self.player = p
+                // The silent audio is what actually keeps the server alive in the
+                // background: if it does not start, say so in the install log instead
+                // of letting a long download be cut off in silence.
+                do {
+                    try AVAudioSession.sharedInstance().setCategory(.playback, options: [.mixWithOthers])
+                    try AVAudioSession.sharedInstance().setActive(true)
+                    let p = try AVAudioPlayer(data: InstallServer.silentWAV())
+                    p.numberOfLoops = -1
+                    p.volume = 0
+                    p.play()
+                    self.player = p
+                    if !p.isPlaying { self.note("Keep-alive audio did not start; long installs may be cut off") }
+                } catch {
+                    self.note("Keep-alive audio failed: \(error.localizedDescription)")
+                }
             } else {
+                self.keepAliveUsers = max(0, self.keepAliveUsers - 1)
+                guard self.keepAliveUsers == 0 else { return }
                 self.player?.stop()
                 self.player = nil
                 try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
@@ -413,9 +483,9 @@ final class InstallServer {
     /// Profile Service request: iOS sends this iPhone's UDID to SayoSign's own server.
     static func udidProfile(base: String) -> Data {
         let content: [String: Any] = ["URL": "\(base)/udid/receive", "DeviceAttributes": ["UDID", "PRODUCT"]]
-        let p: [String: Any] = ["PayloadContent": content, "PayloadOrganization": "SayoSign",
-                                "PayloadDisplayName": "SayoSign UDID",
-                                "PayloadDescription": "Sends this iPhone's UDID to the SayoSign app on this iPhone. Nothing is installed.",
+        let p: [String: Any] = ["PayloadContent": content, "PayloadOrganization": "SayoUnchained",
+                                "PayloadDisplayName": "SayoUnchained UDID",
+                                "PayloadDescription": "Sends this iPhone's UDID to the SayoUnchained app on this iPhone. Nothing is installed.",
                                 "PayloadIdentifier": "dev.murk.sayosign.udid", "PayloadUUID": UUID().uuidString,
                                 "PayloadType": "Profile Service", "PayloadVersion": 1]
         return (try? PropertyListSerialization.data(fromPropertyList: p, format: .xml, options: 0)) ?? Data()
@@ -438,12 +508,21 @@ final class InstallServer {
 enum Installer {
     static func trusted(port: Int) async -> Bool {
         guard let u = URL(string: "https://localhost:\(port)/ping") else { return false }
-        var r = URLRequest(url: u)
-        r.timeoutInterval = 4
-        let s = URLSession(configuration: .ephemeral)
-        defer { s.invalidateAndCancel() }
-        guard let (d, resp) = try? await s.data(for: r), (resp as? HTTPURLResponse)?.statusCode == 200 else { return false }
-        return String(decoding: d, as: UTF8.self) == "ok"
+        // The listener was started a moment ago and NWListener comes up asynchronously:
+        // a single immediate ping can lose that race and report a healthy setup as
+        // missing, so retry a few times before concluding anything.
+        for attempt in 0..<5 {
+            if attempt > 0 { try? await Task.sleep(nanoseconds: 400_000_000) }
+            var r = URLRequest(url: u)
+            r.timeoutInterval = 4
+            let s = URLSession(configuration: .ephemeral)
+            let ok = (try? await s.data(for: r)).map { (d, resp) in
+                (resp as? HTTPURLResponse)?.statusCode == 200 && String(decoding: d, as: UTF8.self) == "ok"
+            } ?? false
+            s.invalidateAndCancel()
+            if ok { return true }
+        }
+        return false
     }
 
     static func bundleInfo(ipa: URL, fallbackID: String, fallbackVersion: String) -> (String, String) {
@@ -478,7 +557,14 @@ enum Installer {
         // iOS refuses to replace the app that is serving the install ("Unable to install").
         // This happens when SayoSign itself was signed with the same explicit-ID profile.
         if let own = Bundle.main.bundleIdentifier, own.caseInsensitiveCompare(app.bundleID) == .orderedSame {
-            throw SayoError(LF("This app got SayoSign's own bundle ID (%@), so installing it would replace SayoSign and iOS refuses. Sign SayoSign with another certificate, or use an Apple ID or a wildcard certificate for this app.", own))
+            throw SayoError(LF("This app got SayoUnchained's own bundle ID (%@), so installing it would replace SayoUnchained and iOS refuses. Sign SayoUnchained with another certificate, or use an Apple ID or a wildcard certificate for this app.", own))
+        }
+        // Automatic mode must never send a free Apple ID app down the OTA route when this
+        // iPhone is not paired: iOS creates the Home Screen placeholder from the manifest
+        // and then refuses the development-profile package, leaving a dead icon and no
+        // error anywhere. A method the user picked explicitly stays as chosen.
+        if app.viaAppleID == true, state.settings.installMethod != 1, state.settings.installMethod != 2, !DeviceLink.isPaired {
+            throw SayoError(L("Apps signed with a free Apple ID cannot be installed over the air. Pair this iPhone first (Settings → Install method → Pair this iPhone), keep LocalDevVPN connected, and install again."))
         }
         if usesPairing(app, state: state) {
             state.busy = L("Connecting to this iPhone")
@@ -495,44 +581,61 @@ enum Installer {
         }
         let server = InstallServer.shared
         let service = manifestService(state)
-        if service != nil {
-            try server.startPlain(port: state.settings.serverPort)
-        } else {
-            try server.start(port: state.settings.serverPort)
-            if !(await trusted(port: state.settings.serverPort)) {
-                throw InstallNeedsSetup()
-            }
+        // The package must travel over HTTPS too: iOS refuses an http:// package even
+        // when the manifest itself came from an HTTPS service, so the full local server
+        // (with its trusted certificate) runs in both cases.
+        try server.start(port: state.settings.serverPort)
+        if !(await trusted(port: state.settings.serverPort)) {
+            throw InstallNeedsSetup()
         }
         let token = UUID().uuidString.prefix(8)
         var iconData: Data?
-        if let lib = app.libraryID.flatMap({ id in state.library.first { $0.id == id } }), let img = state.icon(for: lib) {
-            iconData = img.pngData()
+        var version = app.version
+        if let lib = app.libraryID.flatMap({ id in state.library.first { $0.id == id } }) {
+            if let img = state.icon(for: lib) { iconData = img.pngData() }
+            // An app without CFBundleShortVersionString would put an empty
+            // bundle-version in the manifest, which iOS can refuse outright.
+            if version.isEmpty { version = lib.build }
         }
-        server.serve(Served(ipa: state.ipaURL(app), bundleID: app.bundleID, version: app.version, title: app.name,
+        server.serve(Served(ipa: state.ipaURL(app), bundleID: app.bundleID, version: version, title: app.name,
                             icon: iconData, token: String(token)))
         server.keepAlive(true)
-        server.onIPAFinished = {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { server.keepAlive(false) }
+        var keepAliveOff = false
+        let endKeepAlive = {
+            if keepAliveOff { return }
+            keepAliveOff = true
+            server.keepAlive(false)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 600) { server.keepAlive(false) }
+        server.onIPAFinished = {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { endKeepAlive() }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 600) { endKeepAlive() }
         var manifest = "\(server.httpsBase)/manifest.plist?t=\(token)"
         if let base = service {
-            // The IPA comes straight from this iPhone over plain HTTP; the service only
-            // turns these parameters into the manifest iOS asks for.
+            // The service only turns these parameters into the manifest iOS asks for;
+            // the IPA itself still comes straight from this iPhone, over HTTPS.
             let strict = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
             func q(_ v: String) -> String { v.addingPercentEncoding(withAllowedCharacters: strict) ?? "" }
-            let params = [("url", "\(server.httpBase)/app.ipa?t=\(token)"), ("id", app.bundleID),
-                          ("v", app.version), ("name", app.name)]
+            let params = [("url", "\(server.httpsBase)/app.ipa?t=\(token)"), ("id", app.bundleID),
+                          ("v", version), ("name", app.name)]
             let query = params.map { "\($0.0)=\(q($0.1))" }.joined(separator: "&")
             var b = base.absoluteString
             while b.hasSuffix("/") { b.removeLast() }
             manifest = b + "/?" + query
         }
         server.clearLog()
-        server.note(service != nil ? "Manifest from \(service!.host ?? "service"), IPA over \(server.httpBase)" : "Manifest from local HTTPS server")
+        server.note(service != nil ? "Manifest from \(service!.host ?? "service"), IPA over \(server.httpsBase)" : "Manifest from local HTTPS server")
         let enc = manifest.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=?"))) ?? manifest
         guard let u = URL(string: "itms-services://?action=download-manifest&url=\(enc)") else { return false }
         await UIApplication.shared.open(u)
+        // An OTA install reports nothing back. If iOS never comes for the IPA, the user
+        // is left with a dead placeholder and no explanation, so check the server log
+        // once, after a generous window, and say so.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 90) {
+            if !InstallServer.shared.logLines().contains(where: { $0.contains("/app.ipa") }) {
+                AppState.shared.show(L("iOS did not download the app. If it does not appear on the Home Screen, the install failed — see Settings → Install log."))
+            }
+        }
         return false
     }
 

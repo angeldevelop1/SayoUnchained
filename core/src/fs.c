@@ -17,6 +17,33 @@ int path_join(char *out, size_t cap, const char *a, const char *b) {
     return 0;
 }
 
+int dest_realpath(const char *dest, char *out, size_t cap) {
+    char real[4096];
+    if (!realpath(dest, real)) { sayo_set_error("cannot resolve %s", dest); return -1; }
+    if (snprintf(out, cap, "%s", real) >= (int)cap) { sayo_set_error("path too long"); return -1; }
+    return 0;
+}
+
+/* True when the deepest existing ancestor of path resolves (through any symlinks
+ * an archive planted earlier) to somewhere outside dest_real. The not-yet-existing
+ * tail is safe: entry names cannot contain ".." and those components are created
+ * as plain directories. */
+bool path_escapes_dest(const char *dest_real, const char *path) {
+    char tmp[4096];
+    if (snprintf(tmp, sizeof tmp, "%s", path) >= (int)sizeof tmp) return true;
+    size_t dl = strlen(dest_real);
+    for (;;) {
+        char real[4096];
+        if (realpath(tmp, real)) {
+            if (strncmp(real, dest_real, dl)) return true;
+            return real[dl] != 0 && real[dl] != '/' && dest_real[dl - 1] != '/';
+        }
+        char *s = strrchr(tmp, '/');
+        if (!s || s == tmp) return true;
+        *s = 0;
+    }
+}
+
 bool is_dir(const char *path) {
     struct stat st;
     return lstat(path, &st) == 0 && S_ISDIR(st.st_mode);

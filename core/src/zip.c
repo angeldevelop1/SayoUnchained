@@ -67,6 +67,8 @@ int sayo_unzip(const char *zip_path, const char *dest_dir, sayo_progress_fn prog
     fseeko(f, (off_t)cd_off, SEEK_SET);
     if (fread(cd, 1, cd_size, f) != cd_size) { free(cd); fclose(f); sayo_set_error("read error"); return -1; }
     mkdirs(dest_dir);
+    char dest_real[4096];
+    if (dest_realpath(dest_dir, dest_real, sizeof dest_real)) { free(cd); fclose(f); return -1; }
     uint8_t *in = malloc(CHUNK), *out = malloc(CHUNK);
     size_t pos = 0;
     int rc = 0;
@@ -74,6 +76,7 @@ int sayo_unzip(const char *zip_path, const char *dest_dir, sayo_progress_fn prog
         if (pos + 46 > cd_size || r32(cd + pos) != 0x02014b50) { rc = -1; sayo_set_error("corrupt zip entry"); break; }
         uint8_t *h = cd + pos;
         uint16_t method = r16(h + 10);
+        uint32_t crc_want = r32(h + 16);
         uint64_t csize = r32(h + 20), usize = r32(h + 24);
         uint16_t nlen = r16(h + 28), xlen = r16(h + 30), clen = r16(h + 32);
         uint32_t ext = r32(h + 38);
@@ -100,6 +103,7 @@ int sayo_unzip(const char *zip_path, const char *dest_dir, sayo_progress_fn prog
         if (!safe_name(name)) continue;
         char full[4096];
         if (path_join(full, sizeof full, dest_dir, name)) { rc = -1; break; }
+        if (path_escapes_dest(dest_real, full)) { rc = -1; sayo_set_error("zip entry escapes destination: %s", name); break; }
         if (nl && name[nl - 1] == '/') { mkdirs(full); continue; }
         uint8_t lh[30];
         fseeko(f, (off_t)loff, SEEK_SET);
@@ -117,10 +121,14 @@ int sayo_unzip(const char *zip_path, const char *dest_dir, sayo_progress_fn prog
             if (!o) { rc = -1; sayo_set_error("cannot create %s", full); break; }
         }
         uint64_t left = csize;
+        uint32_t crc = (uint32_t)crc32(0, Z_NULL, 0);
+        uint64_t produced = 0;
         if (method == 0) {
             while (left) {
                 size_t n = left < CHUNK ? (size_t)left : CHUNK;
                 if (fread(in, 1, n, f) != n) { rc = -1; sayo_set_error("truncated zip"); break; }
+                crc = (uint32_t)crc32(crc, in, (uInt)n);
+                produced += n;
                 if (link) sayo_buf_append(&linkbuf, in, n);
                 else if (fwrite(in, 1, n, o) != n) { rc = -1; sayo_set_error("write failed (disk full?)"); break; }
                 left -= n;
@@ -144,6 +152,8 @@ int sayo_unzip(const char *zip_path, const char *dest_dir, sayo_progress_fn prog
                 zr = inflate(&zs, Z_NO_FLUSH);
                 if (zr != Z_OK && zr != Z_STREAM_END && zr != Z_BUF_ERROR) { rc = -1; sayo_set_error("inflate error in %s", name); break; }
                 size_t got = CHUNK - zs.avail_out;
+                crc = (uint32_t)crc32(crc, out, (uInt)got);
+                produced += got;
                 if (link) sayo_buf_append(&linkbuf, out, got);
                 else if (got && fwrite(out, 1, got, o) != got) { rc = -1; sayo_set_error("write failed (disk full?)"); break; }
             }
@@ -152,7 +162,7 @@ int sayo_unzip(const char *zip_path, const char *dest_dir, sayo_progress_fn prog
             rc = -1;
             sayo_set_error("unsupported zip method %d", method);
         }
-        (void)usize;
+        if (rc == 0 && (produced != usize || crc != crc_want)) { rc = -1; sayo_set_error("corrupt zip entry %s", name); }
         if (o) fclose(o);
         if (link && rc == 0) {
             sayo_buf_byte(&linkbuf, 0);

@@ -270,9 +270,34 @@ struct ImportCertificateView: View {
     func autoProfile(near p: URL) {
         guard profile == nil else { return }
         let dir = p.deletingLastPathComponent()
-        if let f = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil))?.first(where: { $0.pathExtension == "mobileprovision" }) {
-            profile = f
+        // Sorted, so the guess is at least the same file every time; save() verifies
+        // the pairing against the certificate before importing.
+        let candidates = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "mobileprovision" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        if let f = candidates.first { profile = f }
+    }
+
+    /// The profile that was actually made for this .p12, if the selected one is not:
+    /// look in the same folder for a profile whose embedded certificates contain
+    /// the .p12's certificate. The folder is shared temp space and can hold stale
+    /// profiles from earlier imports, so "first found" pairs files at random.
+    func matchedProfile(p12Data: Data, current: URL, currentData: Data) -> (URL, Data)? {
+        guard let identity = try? SayoCore.importP12(p12Data, password: password) else { return nil }
+        func matches(_ data: Data) -> Bool {
+            let certs = SayoCore.profileCertificates(data)
+            return certs.isEmpty || certs.contains(identity.certificate)
         }
+        if matches(currentData) { return nil }
+        guard let p = p12 else { return nil }
+        let dir = p.deletingLastPathComponent()
+        let candidates = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "mobileprovision" && $0 != current }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        for f in candidates {
+            if let d = try? Data(contentsOf: f), matches(d) { return (f, d) }
+        }
+        return nil
     }
 
     func save() {
@@ -281,7 +306,19 @@ struct ImportCertificateView: View {
             return
         }
         do {
-            _ = try state.addCertificate(p12: pd, profile: md, password: password, nickname: nickname)
+            var useProfile = m
+            var useData = md
+            if let (f, d) = matchedProfile(p12Data: pd, current: m, currentData: md) {
+                useProfile = f
+                useData = d
+            }
+            _ = try state.addCertificate(p12: pd, profile: useData, password: password, nickname: nickname)
+            // The files here are copies in the shared temp folder; the originals now
+            // live in the certificate's own folder, so the private key does not
+            // linger in temp space.
+            for u in [p, m, useProfile] where u.path.hasPrefix(Paths.work.path) {
+                try? FileManager.default.removeItem(at: u)
+            }
             state.show(L("Certificate added"))
             dismiss()
         } catch {

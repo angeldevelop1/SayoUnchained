@@ -109,7 +109,7 @@ int code_resources(const char *bundle_dir, const char *main_exec_name,
     pl_set(rules2, "^Base\\.lproj/", rule(false, false, 1010));
     pl_set(rules2, "^Info\\.plist$", rule(true, false, 20));
     pl_set(rules2, "^PkgInfo$", rule(true, false, 20));
-    pl_set(rules2, "^embedded\\.provisionprofile$", rule(false, false, 20));
+    pl_set(rules2, "^embedded\\.mobileprovision$", rule(false, false, 20));
     pl_set(rules2, "^version\\.plist$", rule(false, false, 20));
 
     pl_node *root = pl_new(PL_DICT);

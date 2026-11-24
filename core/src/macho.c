@@ -402,6 +402,12 @@ static int sign_slice(slice *s, const char *ident, const char *team,
     uint32_t dataoff;
     if (m.codesig) {
         dataoff = le32(m.codesig + 8);
+        /* The file is truncated at dataoff below; a pre-processed binary can carry
+         * a bogus offset that would silently cut the file mid-code. */
+        if (!dataoff || (uint64_t)dataoff > d->len || (uint64_t)dataoff < le_off) {
+            sayo_set_error("existing LC_CODE_SIGNATURE offset is out of bounds");
+            return -1;
+        }
     } else {
         cmdlist l;
         cl_read(d, &m, &l);

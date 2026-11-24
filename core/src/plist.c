@@ -331,21 +331,21 @@ static pl_node *bp_obj(bp *b, uint64_t idx) {
         return n;
     }
     case 0x4:
-        if (bp_count(b, &q, m, &cnt) || q + cnt > end) return NULL;
+        if (bp_count(b, &q, m, &cnt) || cnt > (uint64_t)(end - q)) return NULL;
         n = pl_new(PL_DATA);
         n->data = malloc(cnt ? cnt : 1);
         memcpy(n->data, q, cnt);
         n->data_len = cnt;
         return n;
     case 0x5:
-        if (bp_count(b, &q, m, &cnt) || q + cnt > end) return NULL;
+        if (bp_count(b, &q, m, &cnt) || cnt > (uint64_t)(end - q)) return NULL;
         n = pl_new(PL_STRING);
         n->str = malloc(cnt + 1);
         memcpy(n->str, q, cnt);
         n->str[cnt] = 0;
         return n;
     case 0x6: {
-        if (bp_count(b, &q, m, &cnt) || q + cnt * 2 > end) return NULL;
+        if (bp_count(b, &q, m, &cnt) || cnt > (uint64_t)(end - q) / 2) return NULL;
         n = pl_new(PL_STRING);
         n->str = malloc(cnt * 4 + 1);
         size_t k = 0;
@@ -366,6 +366,7 @@ static pl_node *bp_obj(bp *b, uint64_t idx) {
     }
     case 0x8: {
         int sz = (m & 0xf) + 1;
+        if (q + sz > end) return NULL;
         n = pl_new(PL_INT);
         n->i = (int64_t)bp_uint(q, sz);
         return n;
@@ -374,7 +375,8 @@ static pl_node *bp_obj(bp *b, uint64_t idx) {
     case 0xD: {
         if (bp_count(b, &q, m, &cnt)) return NULL;
         int dict = hi == 0xD;
-        if (q + cnt * b->rsz * (dict ? 2 : 1) > end) return NULL;
+        uint64_t per = (uint64_t)b->rsz * (dict ? 2 : 1);
+        if (per && cnt > (uint64_t)(end - q) / per) return NULL;
         n = pl_new(dict ? PL_DICT : PL_ARRAY);
         b->depth++;
         for (uint64_t i = 0; i < cnt; i++) {

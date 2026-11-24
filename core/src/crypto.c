@@ -113,8 +113,11 @@ static void aes_dec(const aes_ctx *c, const uint8_t in[16], uint8_t out[16]) {
     memcpy(out, s, 16);
 }
 
+static int aes_keylen_ok(size_t keylen) { return keylen == 16 || keylen == 24 || keylen == 32; }
+
 int sayo_aes_cbc_decrypt(const uint8_t *key, size_t keylen, const uint8_t iv[16], const uint8_t *in, size_t n, sayo_buf *out) {
     sayo_buf_init(out);
+    if (!aes_keylen_ok(keylen)) { sayo_set_error("bad AES key length"); return -1; }
     if (n % 16 || !n) { sayo_set_error("bad CBC length"); return -1; }
     aes_ctx c;
     aes_init(&c, key, (int)keylen);
@@ -136,6 +139,7 @@ int sayo_aes_cbc_decrypt(const uint8_t *key, size_t keylen, const uint8_t iv[16]
 
 int sayo_aes_cbc_encrypt(const uint8_t *key, size_t keylen, const uint8_t iv[16], const uint8_t *in, size_t n, sayo_buf *out) {
     sayo_buf_init(out);
+    if (!aes_keylen_ok(keylen)) { sayo_set_error("bad AES key length"); return -1; }
     aes_ctx c;
     aes_init(&c, key, (int)keylen);
     uint8_t prev[16];
@@ -193,6 +197,7 @@ int sayo_aes_gcm_decrypt(const uint8_t *key, size_t keylen, const uint8_t *iv, s
                          const uint8_t *aad, size_t aadlen, const uint8_t *in, size_t n,
                          const uint8_t tag[16], sayo_buf *out) {
     sayo_buf_init(out);
+    if (!aes_keylen_ok(keylen)) { sayo_set_error("bad AES key length"); return -1; }
     aes_ctx c;
     aes_init(&c, key, (int)keylen);
     uint8_t h[16] = { 0 }, j0[16];

@@ -25,12 +25,47 @@ enum Paths {
     static var stateFile: URL { support.appendingPathComponent("state.json") }
 }
 
+/// Decodes one array element, yielding nil instead of failing the whole list:
+/// one damaged record must not empty the library, the signed apps or the sources.
+private struct Failable<T: Decodable>: Decodable {
+    let value: T?
+    init(from decoder: Decoder) throws { value = try? T(from: decoder) }
+}
+
 struct PersistedState: Codable {
     var library: [LibraryApp] = []
     var signed: [SignedApp] = []
     var certificates: [StoredCertificate] = []
     var sources: [RepoSource] = []
     var settings = AppSettings()
+
+    init() {}
+
+    init(library: [LibraryApp], signed: [SignedApp], certificates: [StoredCertificate], sources: [RepoSource], settings: AppSettings) {
+        self.library = library
+        self.signed = signed
+        self.certificates = certificates
+        self.sources = sources
+        self.settings = settings
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        library = (try? c.decode([Failable<LibraryApp>].self, forKey: .library))?.compactMap(\.value) ?? []
+        signed = (try? c.decode([Failable<SignedApp>].self, forKey: .signed))?.compactMap(\.value) ?? []
+        certificates = (try? c.decode([Failable<StoredCertificate>].self, forKey: .certificates))?.compactMap(\.value) ?? []
+        sources = (try? c.decode([Failable<RepoSource>].self, forKey: .sources))?.compactMap(\.value) ?? []
+        settings = (try? c.decode(AppSettings.self, forKey: .settings)) ?? AppSettings()
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(library, forKey: .library)
+        try c.encode(signed, forKey: .signed)
+        try c.encode(certificates, forKey: .certificates)
+        try c.encode(sources, forKey: .sources)
+        try c.encode(settings, forKey: .settings)
+    }
 }
 
 @MainActor
@@ -41,7 +76,7 @@ final class AppState: ObservableObject {
     @Published var signed: [SignedApp] = []
     @Published var certificates: [StoredCertificate] = []
     @Published var sources: [RepoSource] = []
-    @Published var settings = AppSettings() { didSet { if settings != oldValue { save() } } }
+    @Published var settings = AppSettings() { didSet { if settings != oldValue { saveSoon() } } }
     @Published var downloads: [DownloadTask] = []
     @Published var toast: String?
     @Published var busy: String?
@@ -49,14 +84,26 @@ final class AppState: ObservableObject {
     @Published var tab = 0
 
     private var loading = false
+    /// Set when state.json could not be read at all: saves are held back so the
+    /// unreadable file is never replaced by an empty state.
+    private var loadFailed = false
+    private var savePending = false
+    private var scanningInbox = false
 
     init() { load() }
 
     func load() {
         loading = true
         defer { loading = false }
-        guard let data = try? Data(contentsOf: Paths.stateFile),
-              let s = try? JSONDecoder().decode(PersistedState.self, from: data) else { return }
+        guard let data = try? Data(contentsOf: Paths.stateFile) else { return }
+        guard let s = try? JSONDecoder().decode(PersistedState.self, from: data) else {
+            // Keep a copy of the file we could not read instead of clobbering it later.
+            loadFailed = true
+            let bak = Paths.support.appendingPathComponent("state.json.bak")
+            try? Paths.fm.removeItem(at: bak)
+            try? Paths.fm.copyItem(at: Paths.stateFile, to: bak)
+            return
+        }
         library = s.library.filter { Paths.fm.fileExists(atPath: appURL($0).path) }
         signed = s.signed.filter { Paths.fm.fileExists(atPath: ipaURL($0).path) }
         certificates = s.certificates
@@ -65,10 +112,22 @@ final class AppState: ObservableObject {
     }
 
     func save() {
-        if loading { return }
+        if loading || loadFailed { return }
         let s = PersistedState(library: library, signed: signed, certificates: certificates, sources: sources, settings: settings)
         if let data = try? JSONEncoder().encode(s) {
             try? data.write(to: Paths.stateFile, options: .atomic)
+        }
+    }
+
+    /// Settings change on every keystroke in text fields; coalesce those writes so
+    /// typing does not rewrite the whole state file per character. Explicit save()
+    /// calls stay immediate.
+    func saveSoon() {
+        if loading || savePending { return }
+        savePending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.savePending = false
+            self?.save()
         }
     }
 
@@ -101,7 +160,12 @@ final class AppState: ObservableObject {
                 let safe = name.replacingOccurrences(of: "/", with: "-")
                 let fileName = "\(safe)_\(ver)_asis_\(UUID().uuidString.prefix(6)).ipa"
                 let out = Paths.signed.appendingPathComponent(fileName)
-                try SayoCore.zip(root, to: out, level: level)
+                do {
+                    try SayoCore.zip(root, to: out, level: level)
+                } catch {
+                    try? FileManager.default.removeItem(at: out) // no orphan IPA without a record
+                    throw error
+                }
                 let size = (try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? NSNumber)?.int64Value ?? 0
                 return SignedApp(id: UUID(), libraryID: app.id, name: name, bundleID: bid, version: ver,
                                  certificateName: L("Original signature"), signedAt: Date(), ipaFile: fileName, size: size, tweaks: [])
@@ -121,9 +185,9 @@ final class AppState: ObservableObject {
             guard ok else { return }
             let content = UNMutableNotificationContent()
             content.title = LF("%@ expires tomorrow", app.name)
-            content.body = L("Re-sign it in SayoSign with your Apple ID to keep it working.")
+            content.body = L("Re-sign it in SayoUnchained with your Apple ID to keep it working.")
             content.sound = .default
-            let fire = app.signedAt.addingTimeInterval(6 * 24 * 3600).timeIntervalSinceNow
+            let fire = app.effectiveExpiry.addingTimeInterval(-24 * 3600).timeIntervalSinceNow
             guard fire > 60 else { return }
             let trigger = UNTimeIntervalNotificationTrigger(timeInterval: fire, repeats: false)
             center.add(UNNotificationRequest(identifier: "expiry." + app.id.uuidString, content: content, trigger: trigger))
@@ -174,7 +238,9 @@ final class AppState: ObservableObject {
     nonisolated static func describe(dir: URL, id: UUID, source: String) throws -> LibraryApp {
         let fm = FileManager.default
         let payload = dir.appendingPathComponent("Payload")
-        guard let appName = (try? fm.contentsOfDirectory(atPath: payload.path))?.first(where: { $0.hasSuffix(".app") }) else {
+        // Sorted, so an IPA with several .app bundles is always described the same way.
+        guard let appName = ((try? fm.contentsOfDirectory(atPath: payload.path)) ?? [])
+            .filter({ $0.hasSuffix(".app") }).sorted().first else {
             throw SayoError(L("This file is not a valid IPA"))
         }
         let appDir = payload.appendingPathComponent(appName)
@@ -281,8 +347,15 @@ final class AppState: ObservableObject {
             }
             downloads.removeAll { $0.id == tid }
             let ext = url.pathExtension.lowercased()
-            let renamed = file.deletingLastPathComponent().appendingPathComponent(UUID().uuidString + "." + (ext == "tipa" ? "tipa" : "ipa"))
-            try? Paths.fm.moveItem(at: file, to: renamed)
+            let renamed = file.deletingLastPathComponent().appendingPathComponent(UUID().uuidString + "." + (ext == "tipa" || ext == "zip" ? ext : "ipa"))
+            do {
+                try Paths.fm.moveItem(at: file, to: renamed)
+            } catch {
+                // Report the real error instead of importing a path that does not exist.
+                try? Paths.fm.removeItem(at: file)
+                show(error.localizedDescription)
+                return
+            }
             await importIPA(renamed, source: url.host ?? "web")
             try? Paths.fm.removeItem(at: renamed)
         } catch {
@@ -323,11 +396,20 @@ final class AppState: ObservableObject {
             CertificateImportCoordinator.shared.receive(url)
         case "deb", "dylib":
             let dst = Paths.tweaks.appendingPathComponent(url.lastPathComponent)
+            // Copy to a temp name first and only then replace, so a failed copy
+            // never destroys the tweak that was already saved.
+            let tmp = Paths.tweaks.appendingPathComponent(".\(UUID().uuidString)-" + url.lastPathComponent)
             let scoped = url.startAccessingSecurityScopedResource()
-            try? Paths.fm.removeItem(at: dst)
-            try? Paths.fm.copyItem(at: url, to: dst)
+            do {
+                try Paths.fm.copyItem(at: url, to: tmp)
+                if Paths.fm.fileExists(atPath: dst.path) { try Paths.fm.removeItem(at: dst) }
+                try Paths.fm.moveItem(at: tmp, to: dst)
+                show(LF("Saved tweak %@", url.lastPathComponent))
+            } catch {
+                try? Paths.fm.removeItem(at: tmp)
+                show(error.localizedDescription)
+            }
             if scoped { url.stopAccessingSecurityScopedResource() }
-            show(LF("Saved tweak %@", url.lastPathComponent))
         default:
             show(L("Unsupported file"))
         }
@@ -345,7 +427,10 @@ final class AppState: ObservableObject {
         try Paths.fm.createDirectory(at: dir, withIntermediateDirectories: true)
         try p12.write(to: dir.appendingPathComponent("cert.p12"))
         try profile.write(to: dir.appendingPathComponent("profile.mobileprovision"))
-        Keychain.set(password, for: "p12." + id.uuidString)
+        guard Keychain.set(password, for: "p12." + id.uuidString) else {
+            try? Paths.fm.removeItem(at: dir)
+            throw SayoError(L("Cannot save the certificate password"))
+        }
         let cert = StoredCertificate(id: id, nickname: nickname.isEmpty ? identity.details.organization : nickname,
                                      details: identity.details, profile: pd, p12File: "cert.p12",
                                      profileFile: "profile.mobileprovision", added: Date(), ocsp: .unchecked,
@@ -395,7 +480,15 @@ final class AppState: ObservableObject {
     }
 
     func refreshOCSP(_ c: StoredCertificate) async {
-        guard let identity = try? identity(for: c) else { return }
+        guard let identity = try? identity(for: c) else {
+            // Without this the card would sit on "Checking…" forever.
+            if let i = certificates.firstIndex(where: { $0.id == c.id }), certificates[i].ocsp == .unchecked {
+                certificates[i].ocsp = .unknown
+                certificates[i].ocspChecked = Date()
+                save()
+            }
+            return
+        }
         let (status, when) = await SayoCore.checkOCSP(identity.certificate)
         if let i = certificates.firstIndex(where: { $0.id == c.id }) {
             certificates[i].ocsp = status
@@ -427,18 +520,21 @@ final class AppState: ObservableObject {
     }
 
     func refreshSources() async {
-        await withTaskGroup(of: RepoSource?.self) { group in
+        var failed: [String] = []
+        await withTaskGroup(of: (UUID, RepoSource?).self) { group in
             for s in sources {
                 group.addTask {
-                    guard let u = URL(string: s.url) else { return nil }
-                    return try? await RepoParser.fetch(u, id: s.id)
+                    guard let u = URL(string: s.url) else { return (s.id, nil) }
+                    return (s.id, try? await RepoParser.fetch(u, id: s.id))
                 }
             }
-            for await r in group {
-                if let r = r, let i = sources.firstIndex(where: { $0.id == r.id }) { sources[i] = r }
+            for await (id, r) in group {
+                if let r = r, let i = sources.firstIndex(where: { $0.id == id }) { sources[i] = r }
+                else if let s = sources.first(where: { $0.id == id }) { failed.append(s.name) }
             }
         }
         save()
+        if !failed.isEmpty { show(L("Could not refresh") + ": " + failed.joined(separator: ", ")) }
     }
 
     func performSign(app: LibraryApp, cert c: StoredCertificate, options: SayoCore.SignOptions, tweaks: [URL],
@@ -457,11 +553,13 @@ final class AppState: ObservableObject {
         let libID = app.id
         let ident = try self.identity(for: c)
         var profile: Data
+        var profileExpiry: Date?
         if c.fromAppleID {
             progress(0.02, L("Requesting profile from Apple"))
             let wanted = opts.bundleID.isEmpty ? app.bundleID : opts.bundleID
             let (p, finalID) = try await AppleAccount.profile(for: c, bundleID: wanted, name: appName, anisetteURL: settings.anisetteURL)
             profile = p
+            profileExpiry = SayoCore.profileDetails(p)?.expiration
             opts.bundleID = finalID
             // A profile without this iPhone installs as "Unable to install, try later".
             let udid = settings.udid.trimmingCharacters(in: .whitespaces).uppercased()
@@ -475,6 +573,7 @@ final class AppState: ObservableObject {
         }
         let finalOpts = opts
         let profileData = profile
+        let expiryData = profileExpiry
         do {
             let result: SignedApp = try await Task.detached(priority: .userInitiated) {
                 let fm = FileManager.default
@@ -500,7 +599,7 @@ final class AppState: ObservableObject {
                     let info = NSDictionary(contentsOf: appCopy.appendingPathComponent("Info.plist")) as? [String: Any] ?? [:]
                     guard let exe = info["CFBundleExecutable"] as? String,
                           sayo_macho_make_dylib(appCopy.appendingPathComponent(exe).path) == 0 else {
-                        throw SayoError.last("Cannot prepare the app to run inside SayoSign")
+                        throw SayoError.last("Cannot prepare the app to run inside SayoUnchained")
                     }
                 }
                 try SayoCore.signApp(app: appCopy, profile: profileData, identity: ident, options: o) { f, s in
@@ -515,13 +614,18 @@ final class AppState: ObservableObject {
                 let fileName = "\(safe)_\(finalVersion)_\(UUID().uuidString.prefix(6)).ipa"
                 let out = Paths.signed.appendingPathComponent(fileName)
                 for t in temp { try? fm.removeItem(at: t) }
-                try SayoCore.zip(workRoot, to: out, level: compression)
+                do {
+                    try SayoCore.zip(workRoot, to: out, level: compression)
+                } catch {
+                    try? fm.removeItem(at: out) // no orphan IPA without a record
+                    throw error
+                }
                 try? fm.removeItem(at: workRoot)
                 let size = (try? fm.attributesOfItem(atPath: out.path)[.size] as? NSNumber)?.int64Value ?? 0
                 return SignedApp(id: UUID(), libraryID: libID, name: finalName, bundleID: finalID, version: finalVersion,
                                  certificateName: certName, signedAt: Date(), ipaFile: fileName, size: size,
                                  tweaks: tweaks.map { $0.lastPathComponent }, viaAppleID: viaAppleID,
-                                 container: container ? true : nil)
+                                 container: container ? true : nil, expiresAt: expiryData)
             }.value
             signed.insert(result, at: 0)
             save()
@@ -534,6 +638,11 @@ final class AppState: ObservableObject {
     }
 
     func scanInbox() async {
+        // Called from .task and again when the scene becomes active; a second pass
+        // running alongside the first can delete files the first one just saved.
+        if scanningInbox { return }
+        scanningInbox = true
+        defer { scanningInbox = false }
         let fm = Paths.fm
         let docs = Paths.documents
         guard let items = try? fm.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil) else { return }

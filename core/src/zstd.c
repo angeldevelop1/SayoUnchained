@@ -421,7 +421,12 @@ int sayo_zstd_decode(const uint8_t *p, size_t n, sayo_buf *out) {
         static const int didsz[4] = { 0, 1, 2, 4 };
         pos += didsz[did];
         int fcs = fcs_flag == 0 ? (single ? 1 : 0) : fcs_flag == 1 ? 2 : fcs_flag == 2 ? 4 : 8;
-        pos += fcs;
+        uint64_t fcs_val = 0;
+        for (int i = 0; i < fcs; i++) {
+            if (pos >= n) return -1;
+            fcs_val |= (uint64_t)p[pos++] << (8 * i);
+        }
+        if (fcs_flag == 1) fcs_val += 256;
         if (pos > n) return -1;
         zctx z;
         memset(&z, 0, sizeof z);
@@ -448,6 +453,7 @@ int sayo_zstd_decode(const uint8_t *p, size_t n, sayo_buf *out) {
             } else goto fail;
             if (last) break;
         }
+        if (fcs && out->len - frame_start != fcs_val) { sayo_set_error("zstd frame size mismatch"); goto fail; }
         if (checksum) pos += 4;
         fse_free(&z.ll); fse_free(&z.ml); fse_free(&z.of);
         continue;

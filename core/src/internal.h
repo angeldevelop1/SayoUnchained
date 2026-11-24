@@ -68,6 +68,8 @@ int ent_to_der(const pl_node *dict, sayo_buf *out);
 
 int path_join(char *out, size_t cap, const char *a, const char *b);
 int mkdirs(const char *path);
+int dest_realpath(const char *dest, char *out, size_t cap);
+bool path_escapes_dest(const char *dest_real, const char *path);
 int rmtree(const char *path);
 int copy_file(const char *src, const char *dst);
 int copy_tree(const char *src, const char *dst);

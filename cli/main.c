@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -93,7 +95,7 @@ int main(int argc, char **argv) {
         if (sayo_extract_deb(argv[2], argv[3])) { fprintf(stderr, "error: %s\n", sayo_last_error()); return 1; }
         char **paths;
         size_t n;
-        sayo_collect_tweak_dylibs(argv[3], &paths, &n);
+        if (sayo_collect_tweak_dylibs(argv[3], &paths, &n)) { fprintf(stderr, "error: %s\n", sayo_last_error()); return 1; }
         for (size_t i = 0; i < n; i++) printf("%s\n", paths[i]);
         sayo_free_paths(paths, n);
         return 0;
@@ -103,7 +105,7 @@ int main(int argc, char **argv) {
         if (sayo_read_file(argv[2], &in)) return 1;
         sayo_buf_init(&out);
         if (sayo_zstd_decode(in.data, in.len, &out)) { fprintf(stderr, "error: %s\n", sayo_last_error()); return 1; }
-        sayo_write_file(argv[3], out.data, out.len);
+        if (sayo_write_file(argv[3], out.data, out.len)) { fprintf(stderr, "error: %s\n", sayo_last_error()); return 1; }
         return 0;
     }
 
@@ -138,13 +140,14 @@ int main(int argc, char **argv) {
         case 'l': {
             size_t l = strlen(optarg);
             if (l > 4 && !strcmp(optarg + l - 4, ".deb")) {
+                if (ntmp >= 64) { fprintf(stderr, "error: too many tweaks\n"); return 1; }
                 char *d = malloc(4096);
                 snprintf(d, 4096, "%s/sayodeb.%d.%zu", sayo_tmp_dir(), getpid(), ntmp);
                 if (sayo_extract_deb(optarg, d)) { fprintf(stderr, "error: %s\n", sayo_last_error()); return 1; }
                 tmpdirs[ntmp++] = d;
                 char **paths;
                 size_t n;
-                sayo_collect_tweak_dylibs(d, &paths, &n);
+                if (sayo_collect_tweak_dylibs(d, &paths, &n)) { fprintf(stderr, "error: %s\n", sayo_last_error()); return 1; }
                 for (size_t i = 0; i < n && ninj < 64; i++) injects[ninj++] = strdup(paths[i]);
                 sayo_free_paths(paths, n);
             } else if (ninj < 64) {
@@ -185,9 +188,20 @@ int main(int argc, char **argv) {
             snprintf(rq, sizeof rq, "%s/sayo_ocsp.%d.req", sayo_tmp_dir(), getpid());
             snprintf(rs, sizeof rs, "%s/sayo_ocsp.%d.resp", sayo_tmp_dir(), getpid());
             sayo_write_file(rq, req.data, req.len);
-            char cmdline[1024];
-            snprintf(cmdline, sizeof cmdline, "curl -s -X POST -H \"Content-Type: application/ocsp-request\" --data-binary \"@%s\" \"%s\" -o \"%s\"", rq, url, rs);
-            if (system(cmdline)) { fprintf(stderr, "curl failed\n"); return 1; }
+            char data_arg[1032];
+            snprintf(data_arg, sizeof data_arg, "@%s", rq);
+            pid_t pid = fork();
+            if (pid == 0) {
+                char *args[] = { "curl", "-s", "-X", "POST", "-H", "Content-Type: application/ocsp-request",
+                                 "--data-binary", data_arg, (char *)url, "-o", rs, NULL };
+                execvp("curl", args);
+                _exit(127);
+            }
+            int status = 0;
+            if (pid < 0 || waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                fprintf(stderr, "curl failed\n");
+                return 1;
+            }
             sayo_buf resp;
             if (sayo_read_file(rs, &resp)) return 1;
             remove(rq);

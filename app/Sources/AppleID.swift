@@ -270,8 +270,15 @@ final class Anisette {
                 saveState()
                 return
             case let other:
-                let detail = (m["message"] as? String).map { ": " + $0 } ?? ""
-                throw SayoError(L("Anisette provisioning failed") + " (\(other)\(detail))")
+                // Servers also send informational frames, and frames with no result at
+                // all; only an actual error result is fatal. The loop is bounded, so a
+                // server that never provisions still fails after it.
+                let lower = other.lowercased()
+                if lower.contains("error") || lower.contains("fail") {
+                    let detail = (m["message"] as? String).map { ": " + $0 } ?? ""
+                    throw SayoError(L("Anisette provisioning failed") + " (\(other)\(detail))")
+                }
+                continue
             }
         }
         throw SayoError(L("Anisette provisioning failed"))
@@ -420,6 +427,9 @@ final class GSAuth {
     let anisette: Anisette
     let email: String
     let password: String
+    /// The trusted phone number's ID for SMS codes, read from Apple's /auth answer
+    /// (not always 1: on accounts where it is another entry, the code never arrives).
+    private var smsPhoneID = 1
 
     init(anisette: Anisette, email: String, password: String) {
         self.anisette = anisette
@@ -530,9 +540,16 @@ final class GSAuth {
             let (status, _) = try await AppleHTTP.send(authRequest(try anisette.url("trustedDeviceSecondaryAuth"), method: "GET", r: r))
             if status >= 400 { throw SayoError(L("Apple could not send the code to your devices") + " (HTTP \(status))") }
         case .sms:
-            _ = try await AppleHTTP.send(authRequest(URL(string: "https://gsa.apple.com/auth")!, method: "GET", r: r, json: true))
+            let (_, authData) = try await AppleHTTP.send(authRequest(URL(string: "https://gsa.apple.com/auth")!, method: "GET", r: r, json: true))
+            if let o = try? JSONSerialization.jsonObject(with: authData) as? [String: Any],
+               let phones = o["trustedPhoneNumbers"] as? [[String: Any]] {
+                guard let first = phones.first, let id = first["id"] as? Int else {
+                    throw SayoError(L("Apple lists no trusted phone number for SMS codes on this account. Use a trusted device for the code instead."))
+                }
+                smsPhoneID = id
+            }
             var req = try await authRequest(URL(string: "https://gsa.apple.com/auth/verify/phone")!, method: "PUT", r: r, json: true)
-            req.httpBody = try JSONSerialization.data(withJSONObject: ["phoneNumber": ["id": 1], "mode": "sms"])
+            req.httpBody = try JSONSerialization.data(withJSONObject: ["phoneNumber": ["id": smsPhoneID], "mode": "sms"])
             let (status, _) = try await AppleHTTP.send(req)
             if status >= 400 { throw SayoError(L("Apple could not send the SMS code") + " (HTTP \(status))") }
         }
@@ -551,7 +568,7 @@ final class GSAuth {
             if status >= 400 { throw SayoError(L("Wrong code") + " (HTTP \(status))") }
         case .sms:
             var req = try await authRequest(URL(string: "https://gsa.apple.com/auth/verify/phone/securitycode")!, method: "POST", r: r, json: true)
-            req.httpBody = try JSONSerialization.data(withJSONObject: ["phoneNumber": ["id": 1], "securityCode": ["code": code], "mode": "sms"])
+            req.httpBody = try JSONSerialization.data(withJSONObject: ["phoneNumber": ["id": smsPhoneID], "securityCode": ["code": code], "mode": "sms"])
             let (status, _) = try await AppleHTTP.send(req)
             if status >= 400 { throw SayoError(L("Wrong code") + " (HTTP \(status))") }
         }
@@ -606,6 +623,11 @@ final class DeveloperAPI {
             throw SayoError(L("Apple developer services refused the session. Sign in again.") + " (HTTP \(status))")
         }
         let p = try parsed ?? AppleHTTP.parse(data, status: status, where: "developer services (\(action))")
+        // A server error whose body still parses (or is empty) carries no resultCode and
+        // would otherwise be read as a successful, empty answer.
+        if status >= 500 && (p["resultCode"] as? Int) == nil {
+            throw SayoError(L("Apple's developer services had a problem. Try again in a moment.") + " (HTTP \(status))")
+        }
         let code = (p["resultCode"] as? Int) ?? 0
         if code != 0 {
             let msg = (p["userString"] as? String) ?? (p["resultString"] as? String) ?? "error \(code)"
@@ -746,7 +768,12 @@ enum AppleAccount {
         let team = cert.profile.teamID
         // Signing in again (here, on the desktop or in another sideloading tool) can revoke
         // this certificate; a revoked one only shows up as "Unable to install" later.
-        let alive = try await api.call("listAllDevelopmentCerts", ["teamId": team])["certificates"] as? [[String: Any]] ?? []
+        // Only a successful, parseable list may declare the certificate gone: a failed
+        // or unexpected answer from Apple is not a revocation.
+        let resp = try await api.call("listAllDevelopmentCerts", ["teamId": team])
+        guard let alive = resp["certificates"] as? [[String: Any]] else {
+            throw SayoError(L("Could not verify this certificate with Apple. Check the connection and try again."))
+        }
         if !alive.contains(where: { sameSerial(($0["serialNumber"] as? String) ?? "", cert.details.serial) }) {
             throw SayoError(L("This Apple ID certificate was revoked, probably by signing in somewhere else. Delete it and sign in to your Apple ID again."))
         }
@@ -1035,7 +1062,8 @@ struct AppleIDView: View {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             try der.write(to: dir.appendingPathComponent("cert.der"))
             AppleAccount.saveSession(s, for: id)
-            Keychain.set(password, for: "appleid.password." + id.uuidString)
+            // The password itself is not stored: nothing ever reads it back, and the
+            // saved session is what later signing uses.
             let pd = ProfileDetails(name: "Apple ID: " + s.email, teamName: team["name"] as? String ?? "", teamID: teamID,
                                     appID: teamID + ".*", expiration: details.notAfter, creation: Date(),
                                     devices: [state.settings.udid], allDevices: false, getTaskAllow: true,
@@ -1090,7 +1118,7 @@ struct AppleAccountView: View {
                                 if let d = c["expirationDate"] as? Date {
                                     Text(LF("Expires %@", dateFormatter.string(from: d))).font(.caption2).foregroundColor(.secondary)
                                 }
-                                if isMine(serial) { Text(L("Used by this SayoSign certificate")).font(.caption2).foregroundColor(Theme.rose) }
+                                if isMine(serial) { Text(L("Used by this SayoUnchained certificate")).font(.caption2).foregroundColor(Theme.rose) }
                             }
                             Spacer()
                             Button(L("Revoke"), role: .destructive) { revokeSerial = serial }
@@ -1146,7 +1174,7 @@ struct AppleAccountView: View {
                     if let s = s { Task { await revoke(s) } }
                 }
             } message: {
-                Text(isMine(revokeSerial ?? "") ? L("SayoSign signs with this certificate. After revoking, sign in to your Apple ID again.") : L("Apps signed with it will stop opening."))
+                Text(isMine(revokeSerial ?? "") ? L("SayoUnchained signs with this certificate. After revoking, sign in to your Apple ID again.") : L("Apps signed with it will stop opening."))
             }
             .confirmationDialog(L("Remove this device?"), isPresented: Binding(get: { removeDevice != nil }, set: { if !$0 { removeDevice = nil } }),
                                 titleVisibility: .visible) {

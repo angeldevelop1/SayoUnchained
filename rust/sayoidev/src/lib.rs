@@ -151,32 +151,41 @@ pub unsafe extern "C" fn sayo_idev_pair_host(
             cb(port, c.as_ptr(), ctx.0);
         }
         let pair = async {
-            let accept_v6 = async {
-                match &v6 {
-                    Some(l) => l.accept().await,
-                    None => std::future::pending().await,
+            // A probe or an abandoned attempt on the local network connects and then
+            // goes away again: go back to listening for the next connection instead
+            // of failing the whole pairing (the wait ends on success or cancel).
+            loop {
+                let accept_v6 = async {
+                    match &v6 {
+                        Some(l) => l.accept().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let accept_v4 = async {
+                    match &v4 {
+                        Some(l) => l.accept().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let (stream, _) = tokio::select! {
+                    r = accept_v6 => r,
+                    r = accept_v4 => r,
                 }
-            };
-            let accept_v4 = async {
-                match &v4 {
-                    Some(l) => l.accept().await,
-                    None => std::future::pending().await,
+                .map_err(|e| format!("accept: {e}"))?;
+                let mut host =
+                    PairableHost::new(RpPairingSocket::new_device(stream), host_info.clone());
+                let res = host
+                    .accept(&mut pairing_file, |p: String| async move {
+                        if let (Some(cb), Ok(c)) = (pin, CString::new(p)) {
+                            cb(c.as_ptr(), ctx.0);
+                        }
+                    })
+                    .await;
+                match res {
+                    Ok(()) => break Ok::<(), String>(()),
+                    Err(_) => continue,
                 }
-            };
-            let (stream, _) = tokio::select! {
-                r = accept_v6 => r,
-                r = accept_v4 => r,
             }
-            .map_err(|e| format!("accept: {e}"))?;
-            let mut host = PairableHost::new(RpPairingSocket::new_device(stream), host_info);
-            host.accept(&mut pairing_file, |p: String| async move {
-                if let (Some(cb), Ok(c)) = (pin, CString::new(p)) {
-                    cb(c.as_ptr(), ctx.0);
-                }
-            })
-            .await
-            .map_err(describe)?;
-            Ok::<(), String>(())
         };
         match cancel {
             Some(c) => {
@@ -245,7 +254,9 @@ async fn open_tunnel(
     let rsd_port = tunnel.info.server_rsd_port;
     let raw = tunnel.into_inner();
     let mut adapter = idevice::tcp::adapter::Adapter::new(Box::new(raw), client_ip, server_ip);
-    adapter.set_mss(mtu.saturating_sub(60));
+    // An anomalous MTU at or below the header size would otherwise leave an MSS of 0
+    // and silently dead transfers; fall back to the classic minimum MSS.
+    adapter.set_mss(mtu.saturating_sub(60).max(536));
     let mut adapter = adapter.to_async_handle();
     let rsd = adapter
         .connect(rsd_port)
@@ -320,7 +331,7 @@ pub unsafe extern "C" fn sayo_idev_install(
         let path = cstr(pairing_path)?;
         let ipa = cstr(ipa_path)?;
         let sa = sockaddr(&cstr(addr)?, port)?;
-        RT.block_on(async move {
+        let install = async move {
             report(0, "tunnel");
             let (mut adapter, mut hs) = open_tunnel(&path, sa).await?;
             report(0, "upload");
@@ -336,6 +347,13 @@ pub unsafe extern "C" fn sayo_idev_install(
             .map_err(describe)?;
             report(100, "done");
             Ok(())
+        };
+        // A stalled tunnel or device must not hang the call (and the app's UI) forever;
+        // a local install finishes far below this bound.
+        RT.block_on(async move {
+            tokio::time::timeout(Duration::from_secs(600), install)
+                .await
+                .map_err(|_| "install: timed out".to_string())?
         })
     })();
     match res {

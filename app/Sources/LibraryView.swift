@@ -3,7 +3,6 @@ import UniformTypeIdentifiers
 
 struct LibraryView: View {
     @EnvironmentObject var state: AppState
-    @State private var importing = false
     @State private var urlPrompt = false
     @State private var urlText = ""
     @State private var segment = 0
@@ -44,7 +43,7 @@ struct LibraryView: View {
                     }
                     if segment == 0 {
                         if filteredLibrary.isEmpty && state.downloads.isEmpty {
-                            EmptyState(title: L("No apps yet"), subtitle: L("Import an .ipa from Files, open one with SayoSign, or grab apps from a source."))
+                            EmptyState(title: L("No apps yet"), subtitle: L("Import an .ipa from Files, open one with SayoUnchained, or grab apps from a source."))
                         }
                         ForEach(filteredLibrary) { app in
                             LibraryRow(app: app)
@@ -73,31 +72,28 @@ struct LibraryView: View {
                 .padding(.bottom, 30)
             }
             .background(Color(.systemGroupedBackground).ignoresSafeArea())
-            .navigationTitle("SayoSign")
+            .navigationTitle("SayoUnchained")
             .searchable(text: $search, prompt: L("Search apps"))
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Menu {
-                        Button { importing = true } label: { Label(L("Import from Files"), systemImage: "folder") }
+                        Button { importFromFiles() } label: { Label(L("Import from Files"), systemImage: "folder") }
                         Button { urlPrompt = true } label: { Label(L("Download from URL"), systemImage: "link") }
                     } label: {
                         Image(systemName: "plus.circle.fill").font(.title2).symbolRenderingMode(.hierarchical)
                     }
                 }
             }
-            .fileImporter(isPresented: $importing, allowedContentTypes: [.ipa, .tipa, .zip, .data], allowsMultipleSelection: true) { r in
-                if case .success(let urls) = r {
-                    Task { for u in urls { await state.importIPA(u) } }
-                }
-            }
             .alert(L("Download from URL"), isPresented: $urlPrompt) {
                 TextField("https://…/app.ipa", text: $urlText)
                 Button(L("Cancel"), role: .cancel) {}
                 Button(L("Download")) {
-                    if let u = URL(string: urlText.trimmingCharacters(in: .whitespaces)) {
+                    if let u = URL(string: urlText.trimmingCharacters(in: .whitespaces)), u.scheme != nil {
                         Task { await state.download(u, name: u.lastPathComponent) }
+                        urlText = ""
+                    } else {
+                        state.show(L("Invalid URL"))
                     }
-                    urlText = ""
                 }
             }
             .sheet(item: Binding(get: { share.map { ShareItem(url: $0) } }, set: { share = $0?.url })) { item in
@@ -121,7 +117,7 @@ struct LibraryView: View {
                     Text(c.nickname).font(.headline).lineLimit(1)
                     HStack(spacing: 6) {
                         StatusDot(status: c.ocsp, expired: c.isExpired)
-                        Text(LF("%d days left", c.daysLeft)).font(.caption).foregroundColor(.secondary)
+                        Text(headerDaysText(c)).font(.caption).foregroundColor(.secondary)
                     }
                 } else {
                     Text(L("No certificate")).font(.headline)
@@ -134,6 +130,36 @@ struct LibraryView: View {
         .padding(14)
         .glassy()
         .padding(.top, 6)
+    }
+
+    /// Uses the same UIKit picker as every other flow; SwiftUI's .fileImporter loses
+    /// the picked files here (see FilePicker.swift). An empty result means the picker
+    /// could not be presented, which is reported instead of failing silently.
+    func importFromFiles() {
+        FilePicker.shared.pick([.ipa, .tipa, .zip, .data], multiple: true) { urls in
+            if urls.isEmpty {
+                state.show(L("The Files picker could not be opened"))
+                return
+            }
+            Task { for u in urls { await state.importIPA(u) } }
+        }
+    }
+
+    /// For an Apple ID certificate the number that matters is the soonest expiring
+    /// app signed with it (free profiles die in days), not the certificate's own
+    /// ~1 year. Without such an app, say plainly that the days are the certificate's.
+    func headerDaysText(_ c: StoredCertificate) -> String {
+        if c.fromAppleID {
+            let soonest = state.signed
+                .filter { $0.viaAppleID == true && $0.certificateName == c.nickname }
+                .map { $0.effectiveExpiry }.min()
+            if let soonest = soonest {
+                let d = max(0, Calendar.current.dateComponents([.day], from: Date(), to: soonest).day ?? 0)
+                return LF("Next app expires in %d days", d)
+            }
+            return LF("Certificate: %d days left", c.daysLeft)
+        }
+        return LF("%d days left", c.daysLeft)
     }
 }
 
@@ -211,7 +237,7 @@ struct SignedRow: View {
                         Pill(text: "v" + app.version)
                         Pill(text: app.certificateName, color: .secondary)
                         if !app.tweaks.isEmpty { Pill(text: LF("%d tweaks", app.tweaks.count), color: .purple) }
-                        if app.container == true { Pill(text: L("Inside SayoSign"), color: .teal) }
+                        if app.container == true { Pill(text: L("Inside SayoUnchained"), color: .teal) }
                     }
                 }
                 Spacer(minLength: 6)
@@ -235,11 +261,16 @@ struct SignedRow: View {
     }
 
     func runInside() {
-        do {
-            state.show(LF("%@ starts when you open SayoSign again", app.name))
-            try Container.run(app, ipa: state.ipaURL(app))
-        } catch {
-            state.show(error.localizedDescription)
+        Task {
+            state.busy = L("Preparing")
+            defer { state.busy = nil }
+            do {
+                let appDir = try await Container.prepare(app, ipa: state.ipaURL(app))
+                state.show(LF("%@ starts when you open SayoUnchained again", app.name))
+                try Container.run(app, appDir: appDir)
+            } catch {
+                state.show(error.localizedDescription)
+            }
         }
     }
 
@@ -250,7 +281,7 @@ struct SignedRow: View {
             if try await Installer.install(app, state: state) {
                 state.show(LF("%@ is installed", app.name))
             } else {
-                state.show(L("Confirm the install prompt, keep SayoSign open until the icon finishes"))
+                state.show(L("Confirm the install prompt, keep SayoUnchained open until the icon finishes"))
             }
         } catch is InstallNeedsSetup {
             setup = true

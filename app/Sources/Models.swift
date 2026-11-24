@@ -39,6 +39,12 @@ struct SignedApp: Codable, Identifiable, Hashable {
     var viaAppleID: Bool? = nil
     /// Prepared to run inside SayoSign (LiveContainer-style), not to be installed.
     var container: Bool? = nil
+    /// The provisioning profile's real expiration, stored for Apple ID signatures.
+    var expiresAt: Date? = nil
+
+    /// When this signature stops working. Apple ID records keep the profile's real
+    /// expiration; older ones fall back to the free-profile rule of 7 days.
+    var effectiveExpiry: Date { expiresAt ?? signedAt.addingTimeInterval(7 * 24 * 3600) }
 }
 
 struct StoredCertificate: Codable, Identifiable, Hashable {

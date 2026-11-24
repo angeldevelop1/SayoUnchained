@@ -374,10 +374,12 @@ int sayo_p12_parse(const uint8_t *p12, size_t n, const char *password, sayo_buf 
     }
     if (!o.key.len) BAD("the .p12 has no private key");
     if (!o.ncerts) BAD("the .p12 has no certificate");
-    int pick = 0;
+    int pick = 0, matched = 0, any_id = 0;
     for (int i = 0; i < o.ncerts; i++) {
-        if (o.key_id.len && o.cert_ids[i].len == o.key_id.len && !memcmp(o.cert_ids[i].data, o.key_id.data, o.key_id.len)) { pick = i; break; }
+        if (o.cert_ids[i].len) any_id = 1;
+        if (o.key_id.len && o.cert_ids[i].len == o.key_id.len && !memcmp(o.cert_ids[i].data, o.key_id.data, o.key_id.len)) { pick = i; matched = 1; break; }
     }
+    if (o.key_id.len && any_id && !matched) BAD("no certificate in the .p12 matches the private key");
     sayo_buf_append(cert_der, o.certs[pick].data, o.certs[pick].len);
     sayo_buf_append(rsa_key, o.key.data, o.key.len);
     rc = 0;

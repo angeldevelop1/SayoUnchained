@@ -35,6 +35,7 @@ typedef struct {
     sayo_progress_fn progress;
     void *pctx;
     size_t done, total;
+    const char *main_bid;
 } sctx;
 
 static int find_xml(const uint8_t *p, size_t n, const uint8_t **start, size_t *len) {
@@ -221,6 +222,20 @@ static int sign_bundle(sctx *c, const char *dir, bool is_app) {
     hash_file(ip, info_hash, &ok);
     if (!ok) return -1;
 
+    /* An explicit profile covers exactly one bundle ID. Nested apps outside
+     * PlugIns/Watch are not deleted above, so refuse to stamp the main app's
+     * application-identifier onto one the profile does not name. */
+    if (is_app && c->main_bid && strcmp(bid_s, c->main_bid)) {
+        const char *pa = pl_get_str(c->ents, "application-identifier");
+        if (pa && !strchr(pa, '*')) {
+            const char *pb = strchr(pa, '.');
+            if (!pb || strcmp(pb + 1, bid_s)) {
+                sayo_set_error("nested app %s is not covered by the provisioning profile", bid_s);
+                return -1;
+            }
+        }
+    }
+
     sayo_buf exml, eder;
     sayo_buf_init(&exml);
     sayo_buf_init(&eder);
@@ -387,7 +402,7 @@ static int inject(const char *app, const char *exe_path, const sayo_sign_options
             return -1;
         }
     }
-    if (o->inject_count) macho_add_rpath(exe_path, "@executable_path/Frameworks");
+    if (o->inject_count && macho_add_rpath(exe_path, "@executable_path/Frameworks")) return -1;
     return 0;
 }
 
@@ -514,7 +529,7 @@ int sayo_sign_app(const char *app, const uint8_t *provision, size_t provision_le
     }
 
     copy_provision(app, provision, provision_len);
-    sctx c = { ents, team, id, progress, pctx, 0, count_macho(app) };
+    sctx c = { ents, team, id, progress, pctx, 0, count_macho(app), new_bid };
     int rc = sign_bundle(&c, app, true);
     pl_free(ents);
     if (progress && rc == 0) progress(pctx, 0.9, "sign");

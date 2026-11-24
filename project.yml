@@ -30,8 +30,8 @@ targets:
     info:
       path: app/Info.plist
       properties:
-        CFBundleDisplayName: SayoSign
-        CFBundleName: SayoSign
+        CFBundleDisplayName: SayoUnchained
+        CFBundleName: SayoUnchained
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         CFBundleDevelopmentRegion: en
@@ -49,7 +49,7 @@ targets:
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
           NSAllowsLocalNetworking: true
-        NSLocalNetworkUsageDescription: SayoSign runs a tiny server on this iPhone to install signed apps and to pair with this iPhone in Developer Mode.
+        NSLocalNetworkUsageDescription: SayoUnchained runs a tiny server on this iPhone to install signed apps and to pair with this iPhone in Developer Mode.
         NSBonjourServices: [_remotepairing-pairable-host._tcp, _remotepairing._tcp]
         LSApplicationQueriesSchemes: [itms-services, apple-magnifier, filza, santander]
         CFBundleURLTypes:
@@ -91,7 +91,7 @@ targets:
             LSItemContentTypes: [com.rsa.pkcs-12]
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.murk.sayosign
+        PRODUCT_BUNDLE_IDENTIFIER: com.auditore.SayoUnchained
         PRODUCT_NAME: SayoSign
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor

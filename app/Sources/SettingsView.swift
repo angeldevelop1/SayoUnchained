@@ -59,7 +59,7 @@ struct SettingsView: View {
                         Image("Logo").resizable().frame(width: 64, height: 64)
                             .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("SayoSign").font(.title2.weight(.heavy)).foregroundStyle(Theme.gradient)
+                            Text("SayoUnchained").font(.title2.weight(.heavy)).foregroundStyle(Theme.gradient)
                             Text(L("On-device IPA signer")).font(.subheadline).foregroundColor(.secondary)
                             Text("v" + version).font(.caption).foregroundColor(.secondary)
                         }
@@ -161,9 +161,20 @@ struct SettingsView: View {
                 Section(header: Text(L("Storage"))) {
                     HStack { Text(L("Temporary files")); Spacer(); Text(formatSize(cacheSize)).foregroundColor(.secondary) }
                     Button(L("Clear temporary files")) {
-                        try? FileManager.default.removeItem(at: Paths.work)
+                        // The work folder holds files of operations in flight (an
+                        // import being staged, a signing being prepared): refuse
+                        // instead of breaking them, and report what really happened.
+                        if state.busy != nil || !state.downloads.isEmpty {
+                            state.show(L("Wait for the current operation to finish"))
+                            return
+                        }
+                        do {
+                            try FileManager.default.removeItem(at: Paths.work)
+                            state.show(L("Cleared"))
+                        } catch {
+                            state.show(error.localizedDescription)
+                        }
                         cacheSize = AppState.folderSize(Paths.work)
-                        state.show(L("Cleared"))
                     }
                     Button(L("Reset local installer"), role: .destructive) { confirmReset = true }
                 }
@@ -187,6 +198,8 @@ struct SettingsView: View {
                         Label(L("Website"), systemImage: "safari")
                     }
                     Text(L("Made with 🎀 by murk. Licensed under GPL-3.0. Icon uses Twemoji (CC-BY 4.0)."))
+                        .font(.caption).foregroundColor(.secondary)
+                    Text(L("SayoUnchained is a polished edition of SayoSign. The original app and all of its code were written by murk-sus — we only polished his work. — Team Unchained"))
                         .font(.caption).foregroundColor(.secondary)
                 }
             }
@@ -217,6 +230,10 @@ struct InstallSetupView: View {
     @State private var checking = false
     @State private var error: String?
     @State private var share: URL?
+    /// True while this view holds one of the server's reference-counted
+    /// keepAlive claims (taken in openProfile), so check() only ever ends
+    /// a claim of its own and never one belonging to an install in flight.
+    @State private var keepAliveHeld = false
 
     var body: some View {
         NavigationView {
@@ -231,19 +248,19 @@ struct InstallSetupView: View {
                         Spacer()
                     }
                     Text(trusted ? L("All set!") : L("One-time setup")).font(.title.weight(.bold)).frame(maxWidth: .infinity)
-                    Text(L("iOS only installs apps over HTTPS. SayoSign made a private certificate authority on this iPhone, its key never leaves the device. Trust it once and installs work offline forever."))
+                    Text(L("iOS only installs apps over HTTPS. SayoUnchained made a private certificate authority on this iPhone, its key never leaves the device. Trust it once and installs work offline forever."))
                         .font(.callout).foregroundColor(.secondary)
                     step(1, L("Download the profile"), L("Tap the button and allow the download in Safari.")) {
                         Button(L("Download profile")) { Task { await openProfile() } }.buttonStyle(SmallButtonStyle())
                     }
-                    step(2, L("Install it"), L("Settings → General → VPN & Device Management → SayoSign Local Installer → Install.")) {
+                    step(2, L("Install it"), L("Settings → General → VPN & Device Management → SayoUnchained Local Installer → Install.")) {
                         Button(L("Open Settings")) {
                             if let u = URL(string: "App-prefs:General&path=ManagedConfigurationList") ?? URL(string: UIApplication.openSettingsURLString) {
                                 UIApplication.shared.open(u)
                             }
                         }.buttonStyle(SmallButtonStyle(filled: false))
                     }
-                    step(3, L("Enable full trust"), L("Settings → General → About → Certificate Trust Settings → turn on SayoSign Local CA.")) { EmptyView() }
+                    step(3, L("Enable full trust"), L("Settings → General → About → Certificate Trust Settings → turn on SayoUnchained Local CA.")) { EmptyView() }
                     if let e = error { Text(e).foregroundColor(.red).font(.callout) }
                     Button {
                         if trusted { dismiss() } else { Task { await check() } }
@@ -256,7 +273,7 @@ struct InstallSetupView: View {
                     .buttonStyle(PrimaryButtonStyle())
                     Button(L("Save profile to Files instead")) {
                         if let d = LocalCA.mobileconfig() {
-                            let u = Paths.work.appendingPathComponent("SayoSign.mobileconfig")
+                            let u = Paths.work.appendingPathComponent("SayoUnchained.mobileconfig")
                             try? d.write(to: u)
                             share = u
                         }
@@ -286,11 +303,18 @@ struct InstallSetupView: View {
         }
     }
 
+    func endKeepAlive() {
+        guard keepAliveHeld else { return }
+        keepAliveHeld = false
+        InstallServer.shared.keepAlive(false)
+    }
+
     func openProfile() async {
         do {
             try InstallServer.shared.start(port: state.settings.serverPort)
             InstallServer.shared.keepAlive(true)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { InstallServer.shared.keepAlive(false) }
+            keepAliveHeld = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { endKeepAlive() }
             if let u = URL(string: "\(InstallServer.shared.httpBase)/ca.mobileconfig") { await UIApplication.shared.open(u) }
         } catch {
             self.error = error.localizedDescription
@@ -307,6 +331,6 @@ struct InstallSetupView: View {
         } catch {
             self.error = error.localizedDescription
         }
-        if trusted { InstallServer.shared.keepAlive(false) }
+        if trusted { endKeepAlive() }
     }
 }

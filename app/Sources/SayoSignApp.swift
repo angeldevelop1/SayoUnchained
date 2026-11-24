@@ -37,6 +37,9 @@ struct RootView: View {
                 SettingsView()
                     .tabItem { Label(L("Settings"), systemImage: "gearshape.fill") }
                     .tag(3)
+                AppleIDAppsView()
+                    .tabItem { Label(L("Apple ID"), systemImage: "person.crop.circle.fill") }
+                    .tag(4)
             }
             if let t = state.toast {
                 ToastView(text: t)

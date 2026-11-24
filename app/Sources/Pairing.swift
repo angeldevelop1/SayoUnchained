@@ -7,8 +7,14 @@ import UIKit
 /// over-the-air installs refuse. Needs LocalDevVPN (or another loopback VPN) connected.
 enum DeviceLink {
     static var pairingFile: URL { Paths.support.appendingPathComponent("rp_pairing_file.plist") }
-    static var isPaired: Bool { FileManager.default.fileExists(atPath: pairingFile.path) }
-    static let hostName = "SayoSign"
+    /// A leftover, corrupt or foreign file must not count as paired. Same shape check as
+    /// importPairing: an RPPairing file carries a public key, a lockdown file does not.
+    static var isPaired: Bool {
+        guard let data = try? Data(contentsOf: pairingFile),
+              let p = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else { return false }
+        return p["publicKey"] != nil || p["public_key"] != nil
+    }
+    static let hostName = "SayoUnchained"
 
     /// Saves an RPPairing file made elsewhere (StikDebug, PhonePair, idevice_pair).
     static func importPairing(_ url: URL) throws {
@@ -20,7 +26,7 @@ enum DeviceLink {
         }
         // Lockdown pairing files (.mobiledevicepairing) carry HostCertificate; RPPairing ones do not.
         if p["HostCertificate"] != nil && p["public_key"] == nil && p["publicKey"] == nil {
-            throw SayoError(L("This is a lockdown pairing file. SayoSign needs an RPPairing file (iOS 27 pairing)."))
+            throw SayoError(L("This is a lockdown pairing file. SayoUnchained needs an RPPairing file (iOS 27 pairing)."))
         }
         try? FileManager.default.removeItem(at: pairingFile)
         try data.write(to: pairingFile, options: .completeFileProtectionUntilFirstUserAuthentication)
@@ -43,23 +49,51 @@ enum DeviceLink {
         init(_ fn: @escaping (Int, String) -> Void) { self.fn = fn }
     }
 
+    /// Resumes a continuation at most once: the install and its watchdog race, and
+    /// whichever finishes first wins.
+    private final class ResumeOnce {
+        private let lock = NSLock()
+        private var cont: CheckedContinuation<Void, Error>?
+        init(_ cont: CheckedContinuation<Void, Error>) { self.cont = cont }
+        func resume(_ error: Error?) {
+            lock.lock()
+            let c = cont
+            cont = nil
+            lock.unlock()
+            if let c = c {
+                if let error = error { c.resume(throwing: error) } else { c.resume() }
+            }
+        }
+    }
+
     /// Uploads and installs the IPA through the tunnel; `progress` gets (percent, stage).
     static func install(ipa: URL, address: String, port: Int, progress: @escaping (Int, String) -> Void) async throws {
         guard isPaired else { throw SayoError(L("Pair this iPhone first: Settings → Installing → Pair this iPhone")) }
         let box = ProgressBox(progress)
-        try await Task.detached(priority: .userInitiated) {
-            let ctx = Unmanaged.passRetained(box).toOpaque()
-            defer { Unmanaged<ProgressBox>.fromOpaque(ctx).release() }
-            var err = [CChar](repeating: 0, count: 512)
-            let cb: sayo_idev_progress_cb = { pct, stage, ctx in
-                guard let ctx = ctx else { return }
-                let b = Unmanaged<ProgressBox>.fromOpaque(ctx).takeUnretainedValue()
-                let s = stage.map { String(cString: $0) } ?? ""
-                DispatchQueue.main.async { b.fn(Int(pct), s) }
+        // The Rust call has no timeout and cannot be interrupted; without a watchdog a
+        // stalled tunnel (VPN dropped, wrong address) leaves the UI on "Installing…"
+        // forever. The watchdog only frees the UI: the call itself finishes or fails
+        // in the background and still releases the progress box.
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            let once = ResumeOnce(cont)
+            Task.detached(priority: .userInitiated) {
+                let ctx = Unmanaged.passRetained(box).toOpaque()
+                defer { Unmanaged<ProgressBox>.fromOpaque(ctx).release() }
+                var err = [CChar](repeating: 0, count: 512)
+                let cb: sayo_idev_progress_cb = { pct, stage, ctx in
+                    guard let ctx = ctx else { return }
+                    let b = Unmanaged<ProgressBox>.fromOpaque(ctx).takeUnretainedValue()
+                    let s = stage.map { String(cString: $0) } ?? ""
+                    DispatchQueue.main.async { b.fn(Int(pct), s) }
+                }
+                let rc = sayo_idev_install(DeviceLink.pairingFile.path, address, UInt16(clamping: port), ipa.path, cb, ctx, &err, err.count)
+                once.resume(rc != 0 ? SayoError(String(cString: err)) : nil)
             }
-            let rc = sayo_idev_install(DeviceLink.pairingFile.path, address, UInt16(clamping: port), ipa.path, cb, ctx, &err, err.count)
-            if rc != 0 { throw SayoError(String(cString: err)) }
-        }.value
+            Task.detached {
+                try? await Task.sleep(nanoseconds: 300_000_000_000)
+                once.resume(SayoError(L("The install timed out. Check that LocalDevVPN is connected and try again.")))
+            }
+        }
     }
 }
 
@@ -146,12 +180,12 @@ final class PairingHost: NSObject, ObservableObject, NetServiceDelegate {
         s.delegate = self
         s.publish()
         service = s
-        state = L("Open Settings → Privacy & Security → Developer Mode and tap Pair with SayoSign")
+        state = L("Open Settings → Privacy & Security → Developer Mode and tap Pair with SayoUnchained")
     }
 
     func netService(_ sender: NetService, didNotPublish errorDict: [String: NSNumber]) {
         let code = errorDict[NetService.errorCode]?.intValue ?? 0
-        error = L("Could not advertise on the local network. Connect to Wi-Fi, allow Local Network for SayoSign (Settings → Privacy & Security → Local Network) and try again.")
+        error = L("Could not advertise on the local network. Connect to Wi-Fi, allow Local Network for SayoUnchained (Settings → Privacy & Security → Local Network) and try again.")
             + " (\(code))"
         stop()
     }
@@ -169,7 +203,7 @@ struct PairingView: View {
     var body: some View {
         NavigationView {
             Form {
-                Section(footer: Text(L("Pairing lets SayoSign install apps the way SideStore does, including apps signed with a free Apple ID. It needs iOS 27, Developer Mode and LocalDevVPN (free on the App Store) connected while installing."))) {
+                Section(footer: Text(L("Pairing lets SayoUnchained install apps the way SideStore does, including apps signed with a free Apple ID. It needs iOS 27, Developer Mode and LocalDevVPN (free on the App Store) connected while installing."))) {
                     HStack {
                         Image(systemName: paired ? "checkmark.seal.fill" : "link.badge.plus")
                             .foregroundColor(paired ? .green : Theme.rose).font(.title2)
@@ -192,7 +226,7 @@ struct PairingView: View {
                         Button(L("Cancel"), role: .destructive) { host.stop() }
                     } else {
                         Button { host.start() } label: { Label(L("Pair this iPhone"), systemImage: "iphone.and.arrow.forward") }
-                        Text(L("Tap Pair, then open Settings → Privacy & Security → Developer Mode → Pair with SayoSign and type the code shown here."))
+                        Text(L("Tap Pair, then open Settings → Privacy & Security → Developer Mode → Pair with SayoUnchained and type the code shown here."))
                             .font(.caption).foregroundColor(.secondary)
                     }
                     if let e = host.error { Text(e).foregroundColor(.red).font(.caption) }
