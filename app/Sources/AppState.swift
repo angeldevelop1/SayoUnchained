@@ -669,7 +669,8 @@ final class AppState: ObservableObject {
             var opts = SayoCore.SignOptions()
             opts.removePlugins = settings.autoRemovePlugins
             opts.removeWatch = settings.removeWatchApps
-            guard let fresh = try? await performSign(app: lib, cert: cert, options: opts, tweaks: []) { _, _ in } else { continue }
+            let fresh = try? await performSign(app: lib, cert: cert, options: opts, tweaks: []) { _, _ in }
+            guard let fresh = fresh else { continue }
             // The renewed IPA only helps once it is on the phone; a failed install is
             // not an error here — the fresh record waits in the Signed list.
             _ = try? await Installer.install(fresh, state: self)
