@@ -943,17 +943,27 @@ struct AppleIDView: View {
         await finish(team: team)
     }
 
-    /// Like udid.tech, but served by SayoSign itself on 127.0.0.1: iOS installs nothing, it
-    /// posts this iPhone's UDID back to the app's server, which hands it to the app.
+    /// Like udid.tech, but served by SayoUnchained itself on its own HTTPS
+    /// server: iOS installs nothing, it posts this iPhone's UDID back to the
+    /// app's server, which hands it to the app. The Profile Service reply must
+    /// go to an HTTPS URL iOS trusts, so this only works once the one-time
+    /// Local installer setup (Settings) has been completed.
     func detectUDID() {
         let server = InstallServer.shared
-        do { try server.startPlain(port: state.settings.serverPort) } catch {
+        do { try server.start(port: state.settings.serverPort) } catch {
             self.error = error.localizedDescription
             return
         }
         server.keepAlive(true)
         DispatchQueue.main.asyncAfter(deadline: .now() + 300) { server.keepAlive(false) }
-        if let u = URL(string: "\(server.httpBase)/udid.mobileconfig") { UIApplication.shared.open(u) }
+        let port = state.settings.serverPort
+        Task {
+            if await Installer.trusted(port: port) {
+                if let u = URL(string: "\(server.httpsBase)/udid.mobileconfig") { await UIApplication.shared.open(u) }
+            } else {
+                self.error = L("Automatic UDID detection uses the app's own HTTPS server. Complete the one-time Local installer setup in Settings first, then try again.")
+            }
+        }
     }
 
     func start() async {

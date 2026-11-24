@@ -347,7 +347,7 @@ final class InstallServer {
         note("iOS → \(method) \(path)")
         switch path {
         case "/udid.mobileconfig":
-            respond(c, status: "200 OK", type: "application/x-apple-aspen-config", body: InstallServer.udidProfile(base: httpBase))
+            respond(c, status: "200 OK", type: "application/x-apple-aspen-config", body: InstallServer.udidProfile(base: httpsBase))
         case "/udid/receive":
             // iOS posts a signed plist with the device attributes (Profile Service).
             let text = String(decoding: body, as: UTF8.self)
@@ -358,7 +358,7 @@ final class InstallServer {
             }
             if let u = udid {
                 note("UDID received")
-                let to = "\(httpBase)/udid/done?u=\(u)"
+                let to = "\(httpsBase)/udid/done?u=\(u)"
                 let h = "HTTP/1.1 301 Moved Permanently\r\nLocation: \(to)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 c.send(content: Data(h.utf8), completion: .contentProcessed { _ in c.cancel() })
                 DispatchQueue.main.async { AppState.shared.handleOpen(URL(string: "sayosign://udid?value=\(u)")!) }
