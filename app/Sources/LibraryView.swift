@@ -7,7 +7,6 @@ struct LibraryView: View {
     @State private var urlText = ""
     @State private var segment = 0
     @State private var share: URL?
-    @State private var setup = false
     @State private var search = ""
 
     var filteredLibrary: [LibraryApp] {
@@ -60,7 +59,7 @@ struct LibraryView: View {
                             EmptyState(title: L("Nothing signed yet"), subtitle: L("Signed apps appear here, ready to install or share."))
                         }
                         ForEach(filteredSigned) { app in
-                            SignedRow(app: app, share: $share, setup: $setup)
+                            SignedRow(app: app, share: $share)
                                 .contextMenu {
                                     Button { share = state.ipaURL(app) } label: { Label(L("Share IPA"), systemImage: "square.and.arrow.up") }
                                     Button(role: .destructive) { state.deleteSigned(app) } label: { Label(L("Delete"), systemImage: "trash") }
@@ -98,9 +97,6 @@ struct LibraryView: View {
             }
             .sheet(item: Binding(get: { share.map { ShareItem(url: $0) } }, set: { share = $0?.url })) { item in
                 ShareSheet(items: [item.url])
-            }
-            .sheet(isPresented: $setup) {
-                InstallSetupView().environmentObject(state)
             }
         }
         .navigationViewStyle(.stack)
@@ -223,7 +219,6 @@ struct SignedRow: View {
     @EnvironmentObject var state: AppState
     let app: SignedApp
     @Binding var share: URL?
-    @Binding var setup: Bool
     @State private var installing = false
 
     var body: some View {
@@ -277,16 +272,6 @@ struct SignedRow: View {
     func install() async {
         installing = true
         defer { installing = false }
-        do {
-            if try await Installer.install(app, state: state) {
-                state.show(LF("%@ is installed", app.name))
-            } else {
-                state.show(L("Confirm the install prompt, keep SayoUnchained open until the icon finishes"))
-            }
-        } catch is InstallNeedsSetup {
-            setup = true
-        } catch {
-            state.show(error.localizedDescription)
-        }
+        await state.installSigned(app)
     }
 }

@@ -290,6 +290,7 @@ struct InstallSetupView: View {
             .task { await check() }
             .onChange(of: phase) { p in if p == .active { Task { await check() } } }
         }
+        .statusOverlay()
     }
 
     func step<V: View>(_ n: Int, _ title: String, _ text: String, @ViewBuilder action: () -> V) -> some View {

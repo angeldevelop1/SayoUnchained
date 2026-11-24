@@ -145,6 +145,38 @@ struct ToastView: View {
     }
 }
 
+/// The root view's toast and busy pill as a reusable overlay. A sheet renders
+/// above the root view, so status shown only there stays hidden behind
+/// whichever sheet is open; sheets that give status feedback apply this too.
+struct StatusOverlay: ViewModifier {
+    @EnvironmentObject var state: AppState
+
+    func body(content: Content) -> some View {
+        ZStack(alignment: .top) {
+            content
+            if let t = state.toast {
+                ToastView(text: t)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .padding(.top, 8)
+                    .onTapGesture { state.toast = nil }
+                    .zIndex(10)
+            }
+            if let b = state.busy {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text(b).font(.subheadline.weight(.semibold))
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 12)
+                .glassy()
+                .padding(.top, 8)
+                .zIndex(9)
+            }
+        }
+        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: state.toast)
+    }
+}
+
 struct ShareSheet: UIViewControllerRepresentable {
     let items: [Any]
     func makeUIViewController(context: Context) -> UIActivityViewController {
@@ -154,6 +186,8 @@ struct ShareSheet: UIViewControllerRepresentable {
 }
 
 extension View {
+    func statusOverlay() -> some View { modifier(StatusOverlay()) }
+
     @ViewBuilder func glassy() -> some View {
         #if compiler(>=6.2)
         if #available(iOS 26.0, *) {

@@ -225,6 +225,7 @@ struct ImportCertificateView: View {
                 if let p = p12 { autoProfile(near: p) }
             }
         }
+        .statusOverlay()
     }
 
     func pickFiles() {

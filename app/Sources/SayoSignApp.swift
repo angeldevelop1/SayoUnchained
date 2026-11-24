@@ -23,50 +23,33 @@ struct RootView: View {
     @Environment(\.scenePhase) var phase
 
     var body: some View {
-        ZStack(alignment: .top) {
-            TabView(selection: $state.tab) {
-                LibraryView()
-                    .tabItem { Label(L("Library"), systemImage: "square.stack.3d.up.fill") }
-                    .tag(0)
-                CertificatesView()
-                    .tabItem { Label(L("Certificates"), systemImage: "checkmark.seal.fill") }
-                    .tag(1)
-                SourcesView()
-                    .tabItem { Label(L("Sources"), systemImage: "globe") }
-                    .tag(2)
-                SettingsView()
-                    .tabItem { Label(L("Settings"), systemImage: "gearshape.fill") }
-                    .tag(3)
-                AppleIDAppsView()
-                    .tabItem { Label(L("Apple ID"), systemImage: "person.crop.circle.fill") }
-                    .tag(4)
-            }
-            if let t = state.toast {
-                ToastView(text: t)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                    .padding(.top, 8)
-                    .onTapGesture { state.toast = nil }
-                    .zIndex(10)
-            }
-            if let b = state.busy {
-                HStack(spacing: 10) {
-                    ProgressView()
-                    Text(b).font(.subheadline.weight(.semibold))
-                }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 12)
-                .glassy()
-                .padding(.top, 8)
-                .zIndex(9)
-            }
+        TabView(selection: $state.tab) {
+            LibraryView()
+                .tabItem { Label(L("Library"), systemImage: "square.stack.3d.up.fill") }
+                .tag(0)
+            CertificatesView()
+                .tabItem { Label(L("Certificates"), systemImage: "checkmark.seal.fill") }
+                .tag(1)
+            SourcesView()
+                .tabItem { Label(L("Sources"), systemImage: "globe") }
+                .tag(2)
+            SettingsView()
+                .tabItem { Label(L("Settings"), systemImage: "gearshape.fill") }
+                .tag(3)
+            AppleIDAppsView()
+                .tabItem { Label(L("Apple ID"), systemImage: "person.crop.circle.fill") }
+                .tag(4)
         }
-        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: state.toast)
+        .statusOverlay()
         .sheet(isPresented: $certImport.presented) {
             ImportCertificateView(prefillP12: certImport.p12, prefillProfile: certImport.profile)
                 .environmentObject(state)
         }
-        .sheet(item: $state.pendingSign) { app in
+        .sheet(item: $state.pendingSign, onDismiss: installPending) { app in
             SignView(app: app).environmentObject(state)
+        }
+        .sheet(isPresented: $state.needsInstallSetup) {
+            InstallSetupView().environmentObject(state)
         }
         .onChange(of: phase) { p in
             if p == .active { Task { await state.scanInbox() } }
@@ -78,6 +61,14 @@ struct RootView: View {
                 await state.refreshAllOCSP()
             }
         }
+    }
+
+    /// The Sign sheet hands its freshly signed app over as it closes; the
+    /// install runs here so its busy pill, toasts and setup sheet are visible.
+    func installPending() {
+        guard let app = state.pendingInstall else { return }
+        state.pendingInstall = nil
+        Task { await state.installSigned(app) }
     }
 }
 

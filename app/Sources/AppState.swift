@@ -85,6 +85,12 @@ final class AppState: ObservableObject {
     @Published var toast: String?
     @Published var busy: String?
     @Published var pendingSign: LibraryApp?
+    /// Set by the Sign sheet as it closes: RootView installs this app once the
+    /// sheet is gone, so progress and results are not hidden behind it.
+    @Published var pendingInstall: SignedApp?
+    /// The local installer setup, presented from the root when an install
+    /// (from the Library or after signing) finds it missing.
+    @Published var needsInstallSetup = false
     @Published var tab = 0
 
     private var loading = false
@@ -681,6 +687,23 @@ final class AppState: ObservableObject {
             renewed += 1
         }
         if renewed > 0 { show(LF("Auto re-signed %d app(s)", renewed)) }
+    }
+
+    /// Installs a signed app from the root level, with the same messages as the
+    /// Library's Install button: progress rides the busy pill, the result lands
+    /// in a toast, and a missing local-installer setup opens its sheet here.
+    func installSigned(_ app: SignedApp) async {
+        do {
+            if try await Installer.install(app, state: self) {
+                show(LF("%@ is installed", app.name))
+            } else {
+                show(L("Confirm the install prompt, keep SayoUnchained open until the icon finishes"))
+            }
+        } catch is InstallNeedsSetup {
+            needsInstallSetup = true
+        } catch {
+            show(error.localizedDescription)
+        }
     }
 
     func scanInbox() async {

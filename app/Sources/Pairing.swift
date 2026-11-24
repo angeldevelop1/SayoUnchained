@@ -300,6 +300,7 @@ struct PairingView: View {
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button(L("Close")) { host.stop(); dismiss() } } }
             .onChange(of: host.done) { d in if d { paired = true; state.show(L("This iPhone is paired")) } }
         }
+        .statusOverlay()
     }
 
     func pick() {

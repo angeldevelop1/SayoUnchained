@@ -27,7 +27,6 @@ struct SignView: View {
     @State private var signing = false
     @State private var done: SignedApp?
     @State private var error: String?
-    @State private var setup = false
     @State private var appeared = false
 
     enum PickKind: Identifiable {
@@ -178,16 +177,11 @@ struct SignView: View {
                 } else if let s = done {
                     Section {
                         Button {
-                            Task {
-                                do {
-                                    try await Installer.install(s, state: state)
-                                    dismiss()
-                                } catch is InstallNeedsSetup {
-                                    setup = true
-                                } catch {
-                                    self.error = error.localizedDescription
-                                }
-                            }
+                            // RootView installs once this sheet is gone, so the
+                            // busy pill, the result toast and a possible setup
+                            // sheet are not hidden behind it.
+                            state.pendingInstall = s
+                            dismiss()
                         } label: { Label(L("Install now"), systemImage: "arrow.down.app.fill") }
                             .buttonStyle(PrimaryButtonStyle())
                             .listRowBackground(Color.clear)
@@ -211,7 +205,6 @@ struct SignView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button(L("Close")) { dismiss() } }
             }
-            .sheet(isPresented: $setup) { InstallSetupView().environmentObject(state) }
             .onAppear {
                 // Only the first appearance seeds the toggles from Settings: onAppear
                 // can fire again after a sheet closes, and the user's changes on this
@@ -223,6 +216,7 @@ struct SignView: View {
                 }
             }
         }
+        .statusOverlay()
         .interactiveDismissDisabled(signing)
     }
 
