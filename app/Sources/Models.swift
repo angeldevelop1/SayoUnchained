@@ -114,7 +114,7 @@ struct AppSettings: Codable, Equatable {
     var installMethod = 0
     /// LocalDevVPN's address of this iPhone.
     var tunnelAddress = "10.7.0.1"
-    static let defaultManifestService = "https://sayosign.afk9659-0de.workers.dev"
+    static let defaultManifestService = ""
 
     init() {}
 
