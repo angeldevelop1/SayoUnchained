@@ -182,7 +182,7 @@ pub unsafe extern "C" fn sayo_idev_pair_host(
                     })
                     .await;
                 match res {
-                    Ok(()) => break Ok::<(), String>(()),
+                    Ok(_) => break Ok::<(), String>(()),
                     Err(_) => continue,
                 }
             }
